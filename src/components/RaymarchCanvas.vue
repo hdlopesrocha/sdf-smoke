@@ -124,12 +124,12 @@ const config = reactive({
   smokeRadius: 1.7,
   smokeDensity: 2.0,
   // Perlin billows.
-  noiseAmplitude: 0.45,
-  noiseFrequency: 2.0,
+  noiseAmplitude: 0.8,
+  noiseFrequency: 4.0,
   noiseOctaves: 4,
   noiseLacunarity: 2.0,
   noiseGain: 0.8,
-  noiseSpeed: 0.5,
+  noiseSpeed: 0,
   // Bullet shockwave cone.
   coneAngle: 35.0,
   coneLength: 3.5,
@@ -139,7 +139,7 @@ const config = reactive({
   // Light & heat.
   smokeColor: '#8ea2c8',
   heatColor: '#ff7a26',
-  anisotropy: 0.45,
+  anisotropy: 0.3,
   heatStrength: 0,
   scatter: 1.0,
   maxDevicePixelRatio: 2.0,
