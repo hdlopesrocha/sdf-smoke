@@ -47,7 +47,7 @@
         <input type="range" min="0.2" max="0.8" step="0.01" v-model.number="config.noiseGain" />
       </label>
       <label class="ctl">
-        <span>Drift <code>{{ config.noiseSpeed.toFixed(2) }}</code></span>
+        <span>Flow speed <code>{{ config.noiseSpeed.toFixed(2) }}</code></span>
         <input type="range" min="0" max="1.5" step="0.05" v-model.number="config.noiseSpeed" />
       </label>
       <div class="controls-title">Shockwave</div>

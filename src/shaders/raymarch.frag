@@ -45,7 +45,7 @@ uniform float uNoiseFrequency;  // base spatial frequency of the billows
 uniform int uNoiseOctaves;      // fBm octave count, 1..MAX_OCTAVES
 uniform float uLacunarity;      // frequency multiplier per octave (~2.0)
 uniform float uNoiseGain;       // amplitude multiplier per octave / persistence (~0.5)
-uniform float uNoiseSpeed;      // scales the loop-safe morph wobble
+uniform float uNoiseSpeed;      // billow flow speed (loop-safe multi-harmonic churn)
 
 // --- Shockwave cone uniforms (uConeAngleDeg = FULL apex angle) ---
 uniform float uConeAngleDeg;
@@ -220,11 +220,17 @@ float loopPhase() {
   return fract(uTime / LOOP_DURATION);
 }
 
-// Circular domain offset: continuous at the wrap, churns the billows.
-vec2 smokeWobble(float phase) {
-  float a = phase * TAU;
-  float amp = 0.1 + uNoiseSpeed * 0.6;
-  return vec2(cos(a), sin(a)) * amp;
+// 3D domain flow: continuous at the wrap, churns the billows in depth too.
+// Higher harmonics fade in with uNoiseSpeed, so the slider genuinely
+// adjusts the flow speed while every term stays an integer cycle per loop.
+vec3 smokeWobble(float phase) {
+  float a1 = phase * TAU;
+  float a2 = a1 * 2.0;
+  float a3 = a1 * 3.0;
+  float s = uNoiseSpeed;
+  return vec3(cos(a1), sin(a1), 0.6 * sin(a1 + 2.1)) * (0.10 + 0.25 * s)
+    + vec3(cos(a2 + 0.7), sin(a2 + 1.9), cos(a2 + 3.1)) * (0.22 * s)
+    + vec3(sin(a3 + 2.2), cos(a3 + 0.4), sin(a3 + 1.1)) * (0.12 * s);
 }
 
 float bulletX(float phase) {
@@ -263,7 +269,7 @@ float coneField(vec3 p, float phase, float fade, float coneOX, float baseR) {
 // with the distorted shock cone SUBTRACTED (carved tunnel, rippled walls)
 // and the density adapted to air compression (shock shell squeeze,
 // core rarefaction, nose stagnation). Returns vec2(density, heat).
-vec2 smokeDensityAt(vec3 p, float phase, vec2 wob, float dCone, float fade, float coneOX) {
+vec2 smokeDensityAt(vec3 p, float phase, vec3 wob, float dCone, float fade, float coneOX) {
   float heat = 0.0;
   float pushBand = 0.0;
   float shell = 0.0;
@@ -285,8 +291,7 @@ vec2 smokeDensityAt(vec3 p, float phase, vec2 wob, float dCone, float fade, floa
   vec3 radial = vec3(0.0, p.y, p.z);
   float rl = length(radial);
   vec3 rdir = rl > 0.0001 ? radial / rl : vec3(0.0, 1.0, 0.0);
-  vec3 q = (p - SMOKE_CENTER + rdir * (pushBand * uPush * 0.6)) * uNoiseFrequency
-    + vec3(wob.x, wob.y, 0.0);
+  vec3 q = (p - SMOKE_CENTER + rdir * (pushBand * uPush * 0.6)) * uNoiseFrequency + wob;
   float f = fbm(q, uNoiseOctaves, uLacunarity, uNoiseGain);
   float filament = smoothstep(-0.25, 0.65, f);
   float dens = pow(fall, 1.5) * mix(0.25, 1.0, filament);
@@ -348,7 +353,7 @@ vec3 backgroundColor(vec3 d) {
 // Front-to-back volume integration between t0 and t1.
 // Returns vec4(rgb, transmittance); heatOD gathers the hot-air column
 // (drives the background shimmer after the march).
-vec4 marchSmoke(vec3 ro, vec3 rd, float t0, float t1, vec2 wob,
+vec4 marchSmoke(vec3 ro, vec3 rd, float t0, float t1, vec3 wob,
     float phase, float fade, float coneOX, float baseR, float gg,
     inout float heatOD) {
   vec3 lightDir = normalize(uLightDirection);
@@ -393,7 +398,7 @@ void main() {
   float coneOX;
   float baseR;
   loopState(phase, fade, bx, coneOX, baseR);
-  vec2 wob = smokeWobble(phase);
+  vec3 wob = smokeWobble(phase);
   float gg = clamp(uAnisotropy, -0.85, 0.85);
 
   // --- Build camera basis ---
