@@ -32,7 +32,10 @@ uniform float uCameraFov;       // vertical field of view, degrees
 uniform float uAspectRatio;    // canvasWidth / canvasHeight
 
 // --- Smoke medium uniforms ---
-uniform float uSmokeRadius;    // base radius of the smoke puff
+uniform float uShapeSize;      // master size: smoke/sphere radius, cube bounding radius
+uniform float uShapeYaw;       // object rotation, radians (yaw about Y)
+uniform float uShapePitch;     // object rotation, radians (pitch about X)
+uniform float uShapeRoll;      // object rotation, radians (roll about Z)
 uniform float uSmokeDensity;   // extinction scale (absorption + scattering)
 uniform vec3 uSmokeColor;      // smoke albedo / body colour
 uniform float uScatter;        // directional scattering brightness
@@ -66,9 +69,10 @@ uniform int uGroundOct;        // perturbation octave count, 1..MAX_OCTAVES
 uniform float uGroundLac;      // perturbation frequency multiplier per octave
 
 // --- Sphere shatter mode uniforms ---
-uniform float uMode;           // 0 = smoke cloud, 1 = plastic sphere
-uniform float uShardFreq;      // voronoi cell density (shard size ~ 1/freq)
+uniform float uMode;           // 0 = smoke cloud, 1 = plastic sphere, 2 = plastic cube
+// shard scale fixed at 1.0; max shard fixed at 5.0 (see shardFreqAt)
 uniform float uShardMin;       // smallest allowed shard, world units (hard cap)
+// (decl merged above)
 
 // --- Visibility & debug uniforms ---
 uniform float uShowGround;     // 0 = plane hidden, 1 = visible
@@ -100,11 +104,56 @@ const int MAX_OCTAVES = 8;
 const float LOOP_DURATION = 16.0;
 const float EXPAND = 0.5; // smoke expansion phase each loop (seconds)
 float gRadius = 1.0; // effective smoke/sphere radius after expansion envelope
+mat3 gRot;     // object rotation for this pixel (set in main)
+mat3 gRotInv;  // its transpose = inverse (rotation is orthogonal)
+
+// Generic object rotation: yaw (Y), then pitch (X), then roll (Z).
+mat3 shapeRotMat(float yaw, float pitch, float roll) {
+  float cx = cos(pitch);
+  float sx = sin(pitch);
+  float cy = cos(yaw);
+  float sy = sin(yaw);
+  float cz = cos(roll);
+  float sz = sin(roll);
+  mat3 rx = mat3(1.0, 0.0, 0.0, 0.0, cx, sx, 0.0, -sx, cx);
+  mat3 ry = mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
+  mat3 rz = mat3(cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0);
+  return ry * rx * rz;
+}
+
+// Transpose (GLSL ES 1.00 has no transpose() builtin). For rotation
+// matrices this is the inverse.
+mat3 transpose3(mat3 m) {
+  return mat3(m[0][0], m[1][0], m[2][0],
+              m[0][1], m[1][1], m[2][1],
+              m[0][2], m[1][2], m[2][2]);
+}
 const float TAU = 6.2831853;
 const float BULLET_X1 = 3.2;
 const float BULLET_RADIUS = 0.14;
+// (bullet rig lives below SMOKE_CENTER; GLSL needs declaration order)
 const float BULLET_MIN_VIS = 0.4; // readability floor, see bullet branch
 const vec3 SMOKE_CENTER = vec3(0.0, 0.0, 0.0);
+
+// ================= BULLET RIG (generic, shape-agnostic) =================
+// The ONLY bullet knowledge in the shader. Shapes consume pos/dir/speed/
+// fade and compute their own response (impact, shatter, carve), so the rig
+// applies unchanged to smoke, sphere, cube, or future shapes.
+const vec3 BULLET_DIR = vec3(1.0, 0.0, 0.0); // flight axis (+X)
+const float BULLET_REF_SPEED = 3.2;          // normalizes chunk motion
+uniform float uBulletSpeed;                  // world units per second (live)
+
+vec3 bulletSpawn() {
+  return vec3(SMOKE_CENTER.x - uShapeSize, 0.0, 0.0);
+}
+
+float bulletFade(float loopT) {
+  return smoothstep(0.0, EXPAND, loopT);
+}
+
+float bulletClock(float loopT) {
+  return max(loopT - EXPAND, 0.0); // seconds since launch
+}
 // Square ground slab under the smoke: 8x8 footprint, thin 0.25 thickness.
 const vec3 GROUND_HALF = vec3(4.0, 0.125, 4.0);
 const float SLAB_IOR = 1.3;
@@ -332,24 +381,20 @@ float loopPhase() {
 }
 
 float bulletX(float phase) {
-  return mix(SMOKE_CENTER.x - uSmokeRadius, BULLET_X1, phase);
+  return mix(SMOKE_CENTER.x - uShapeSize, BULLET_X1, phase);
 }
 
 void loopState(out float phase, out float fade, out float bx, out float coneOX, out float baseR) {
   phase = loopPhase();
-  // Single blazing pass per loop: spawn in contact, cross while phase <
-  // window, parked invisible (fade 0) the rest of the loop.
-  // Bullet clock: parked during the 0.5 s smoke expansion, then one pass.
+  // One bullet: frozen at spawn during smoke expansion, then flying straight
+  // at constant speed with no fade-outs until the loop restarts there.
   // Smoke radius ramps 0 -> full over EXPAND (and back down at the wrap
   // so the loop stays seamless); floor keeps every 1/R term finite.
   float loopT = phase * LOOP_DURATION;
-  gRadius = uSmokeRadius * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(LOOP_DURATION - EXPAND, LOOP_DURATION, loopT)), 0.001);
-  float bulletT = max(loopT - EXPAND, 0.0);
-  float w = min(bulletT / 2.0, 1.0);
-  fade = smoothstep(0.0, 0.08, w) * (1.0 - smoothstep(0.92, 1.0, w));
-  // Spawn in contact: shape_position - flight_dir * shape_radius.
-  float bx0 = SMOKE_CENTER.x - uSmokeRadius;
-  bx = mix(bx0, BULLET_X1, w);
+  gRadius = uShapeSize * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(LOOP_DURATION - EXPAND, LOOP_DURATION, loopT)), 0.001);
+  vec3 bpos = bulletSpawn() + BULLET_DIR * (uBulletSpeed * bulletClock(loopT));
+  bx = bpos.x;
+  fade = bulletFade(loopT);
   coneOX = bx - 0.05;
   baseR = uConeLength * tan(radians(uConeAngleDeg * 0.5));
 }
@@ -368,8 +413,8 @@ float bulletSDF(vec3 p, float bx, float fade) {
 // sphere mode kisses the ball's underside, cloud mode clears the wispy extent.
 vec3 groundCenter() {
   float top = (uMode > 0.5)
-    ? -uSmokeRadius - 0.1
-    : -(uSmokeRadius * 1.35 + 0.2);
+    ? -uShapeSize - 0.1
+    : -(uShapeSize * 1.35 + 0.2);
   return vec3(0.0, top - GROUND_HALF.y, 0.0);
 }
 
@@ -442,22 +487,26 @@ vec4 voronoi(vec3 p, out vec3 feat) {
 // (With graded frequency the pivot is approximate to ~8% of a cell, a
 // static micro-bend, invisible next to the chunks themselves.)
 // uShardMin floors the piece size as a safety cap.
-float shardFreqAt(vec3 p) {
-  vec3 rel = p - SMOKE_CENTER;
-  float dI = length(rel - vec3(-gRadius, 0.0, 0.0));
+// Cell density grades with distance from the impact crater, evaluated in
+// OBJECT space (rel = shape-frame offset from center) so the dense zone
+// rotates with the shape. Frozen/static: impact-only, never time-varying.
+float shardFreqAt(vec3 rel) {
+  vec3 craterObj = gRotInv * vec3(-uShapeSize, 0.0, 0.0);
+  float dI = length(rel - craterObj);
   // Far field settles to ~4 coarse plates; the crater term subdivides down
   // to rubble as distance -> 0.
   float far = smoothstep(0.0, 2.0 * gRadius, dI);
   float crater = 1.0 - far;
-  float freq = uShardFreq * (mix(1.0, 0.18, far) + crater * crater * 2.5);
-  return min(freq, 1.0 / max(uShardMin, 0.02));
+  float freq = mix(1.0, 0.18, far) + crater * crater * 2.5;
+  freq = clamp(freq, 1.0 / 5.0, 1.0 / max(uShardMin, 0.02));
+  return freq;
 }
 
 // Gap half-width along partition borders: opens fast after impact, holds.
-// Scaled to the cell size so gaps read as empty at any shard frequency
-// without ever swallowing whole pieces.
+// Scaled to the cell size; opens softly (smoothstep, no hard cut) so gaps
+// read as empty at any shard frequency without swallowing whole pieces.
 float gapHalfWidth(float tSince, float freq) {
-  return min(tSince * 0.25, 0.175 / freq);
+  return (0.175 / freq) * smoothstep(0.0, 1.2, tSince);
 }
 
 // Proper rotation matrix (Rodrigues, column-major): det +1, orthogonal.
@@ -479,12 +528,22 @@ float coneField(vec3 p, float phase, float fade, float coneOX, float baseR);
 // Last chunk-frame border from marching (SDF -> shading handoff, below).
 float gBorderW = 10.0;
 
+// Generic solid in unit space: sphere, or cube whose bounding sphere is 1
+// (half extent 1/sqrt(3)), selected by uMode. World d = local * SIZE.
+float solidBaseSDF(vec3 pl) {
+  if (uMode < 1.5) {
+    return length(pl) - 1.0;
+  }
+  return sdBox(pl, vec3(0.5773503));
+}
+
 float sphereShatterSDF(vec3 p, float tSince) {
   if (tSince <= 0.0) {
-    return sdSphere(p - SMOKE_CENTER, gRadius);
+    return solidBaseSDF((gRotInv * (p - SMOKE_CENTER)) / gRadius) * gRadius;
   }
   vec3 rel = p - SMOKE_CENTER;
-  float freq = shardFreqAt(p);
+  vec3 obj = gRotInv * rel;
+  float freq = shardFreqAt(obj);
   // Cheap far exit: all debris stays within reach of the original shell,
   // so distant samples return a valid bound with zero voronoi cost.
   // (This is also what restores full speed: most march steps exit here.)
@@ -494,8 +553,8 @@ float sphereShatterSDF(vec3 p, float tSince) {
     return dFar;
   }
   vec3 feat;
-  vec4 v = voronoi((p - SMOKE_CENTER) * freq, feat);
-  vec3 pivot = p + feat * min(1.0 / freq, 0.75); // chunk centroid, offset clamped:
+  vec4 v = voronoi(obj * freq, feat);
+  vec3 pivot = obj + feat * min(1.0 / freq, 0.75); // chunk centroid, offset clamped:
   // far cells would otherwise place it units away, turning the whole chunk
   // frame (motion, normals, shading) into background speckle. Near-sphere
   // cells (freq > 1.33) are untouched.
@@ -504,7 +563,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // surface, so impact is at window start): chunk ballistics lock to
   // hit-time conditions, so every fragment keeps its exact dimensions
   // and shape for the whole animation.
-  float coneOX = SMOKE_CENTER.x - uSmokeRadius - 0.05;
+  float coneOX = SMOKE_CENTER.x - uShapeSize - 0.05;
   float baseR = uConeLength * tan(radians(uConeAngleDeg * 0.5));
   // Air pressure sampled ONCE at impact time from the SMOOTH base cone
   // (same shell/stagnation model as the smoke, minus ripple detail so
@@ -512,20 +571,21 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // tearing into jitter). Everything below derives from the pivot (never
   // from p or from live bullet state), so each chunk moves as one rigid
   // body: constant velocity, constant spin.
-  vec3 conePs = vec3(pivot.y, coneOX - pivot.x, pivot.z);
+  vec3 pW = SMOKE_CENTER + gRot * pivot; // chunk centroid back in world
+  vec3 conePs = vec3(pW.y, coneOX - pW.x, pW.z);
   float dCp = sdRoundCone(conePs, 0.03, baseR, uConeLength);
   float sbp = (dCp - 0.12) * 9.0;
   float shellp = exp(-sbp * sbp);
-  float sAh = pivot.x - (coneOX + 0.19);
+  float sAh = pW.x - (coneOX + 0.19);
   float qa = sAh / 0.35;
-  float qr = length(pivot.yz) / 0.30;
+  float qr = length(pW.yz) / 0.30;
   float stagp = (sAh > -0.1)
     ? exp(-(qa * qa + qr * qr)) * smoothstep(-0.1, 0.15, sAh)
     : 0.0;
   float press = shellp * 1.2 + stagp * 0.8
     - (1.0 - smoothstep(-0.35, 0.05, dCp)) * 0.9;
   float push = max(press, 0.0);
-  vec3 n0 = (pivot - SMOKE_CENTER) / max(length(pivot - SMOKE_CENTER), 0.001);
+  vec3 n0 = pivot / max(length(pivot), 0.001);
   vec3 R = reflect(vec3(1.0, 0.0, 0.0), n0);
   float facing = clamp(dot(n0, vec3(-1.0, 0.0, 0.0)), 0.0, 1.0);
   // Smoke-coupled flight: advect with the same shock flow that streams the
@@ -535,27 +595,40 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // at any angle) provides the drama. All inputs frozen per chunk.
   float pb = dCp * 3.0;
   float flowBand = exp(-pb * pb);
-  vec3 coneR = vec3(0.0, pivot.y, pivot.z);
-  float crl = length(coneR);
-  vec3 radFlow = (crl > 0.0001) ? coneR / crl : vec3(0.0, 1.0, 0.0);
-  vec3 flowRaw = mix(radFlow, R, clamp(0.3 + facing * 0.7, 0.0, 1.0)) + rnd * 0.25;
-  vec3 flowDir = flowRaw / max(length(flowRaw), 0.05);
+  // Bullet-wave direction: mostly +X travel with a touch of reflection
+  // deflection; pieces translate rigidly (never distort) and rotate.
+  vec3 flyRaw = vec3(1.0, 0.0, 0.0) + R * (0.3 * facing) + rnd * 0.2;
+  vec3 flyDir = flyRaw / max(length(flyRaw), 0.05);
   float drive = clamp(push + facing * 0.5 + flowBand * uPush * 0.5, 0.0, 2.0);
-  float sepMax = (0.12 + 0.38 * (drive / 2.0)) / freq;
-  vec3 T = flowDir * (sepMax * (1.0 - exp(-tSince * 2.2)));
+  float sepMax = min((0.10 + 0.30 * (drive / 2.0)) / freq, 0.30);
+  float speedRatio = uBulletSpeed / BULLET_REF_SPEED; // chunks follow bullet speed
+  // Eject out of the void along the cone wall (object frame): chunks leave
+  // the cone interior instead of lingering in it. Capped with the hover so
+  // total travel stays lookup-valid.
+  vec3 coneAxisObj = gRotInv * vec3(1.0, 0.0, 0.0);
+  vec3 radObj = pivot - coneAxisObj * dot(pivot, coneAxisObj);
+  vec3 ejectDir = (coneAxisObj * 0.35 + radObj) / max(length(coneAxisObj * 0.35 + radObj), 0.05);
+  float core = 1.0 - smoothstep(-0.5, 0.05, dCp);
+  vec3 Traw = flyDir * sepMax + ejectDir * (0.45 * core);
+  float capT = min(0.5 / freq + 0.08, 0.5);
+  vec3 T = Traw * min(1.0, capT / max(length(Traw), 0.0001)) * (1.0 - exp(-tSince * 2.2 * speedRatio));
   // Own rotation: roll in the deflection plane, harder where pressure peaks.
   vec3 ax = cross(R, vec3(1.0, 0.0, 0.0)) + rnd * 0.9;
   float axl = length(ax);
   ax = (axl > 0.001) ? ax / axl : vec3(0.0, 1.0, 0.0);
-  float ang = 0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince;
+  float ang = min(0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince * speedRatio, 2.5);
   mat3 Ri = rotAxisAngle(ax, -ang);
-  vec3 q = pivot + Ri * (p - pivot - T);
-  float dChunk = sdSphere(q - SMOKE_CENTER, gRadius);
+  vec3 q = pivot + Ri * (obj - pivot - T);
+  // Vaporize inside the void: uniform shrink toward the pivot (similarity,
+  // shape preserved) driven by cone depth at the centroid.
+  float shrink = mix(0.25, 1.0, smoothstep(-0.5, 0.05, dCp));
+  vec3 qs = pivot + (q - pivot) / shrink;
+  float dChunk = solidBaseSDF(qs / gRadius) * gRadius * shrink;
   // Borders are tested in the chunk frame (they move with the pieces): a
   // second voronoi at q keeps the carve glued to the rotating chunks, so no
   // ghost shell lingers in the gaps and no static grid slices the pieces.
   vec3 dummy2;
-  vec4 vq = voronoi((q - SMOKE_CENTER) * freq, dummy2);
+  vec4 vq = voronoi(q * freq, dummy2);
   float borderW = (vq.y - vq.x) / freq;
   gBorderW = borderW;
   float dOpen = max(dChunk, gapHalfWidth(tSince, freq) - borderW);
@@ -589,11 +662,19 @@ vec3 groundNormal(vec3 p, vec3 ro) {
 // Distorted shock-cone SDF: base cone + animated compression ripple.
 // Integer phase cycles keep the ripple loop-safe.
 float coneField(vec3 p, float phase, float fade, float coneOX, float baseR) {
-  vec3 coneP = vec3(p.y, coneOX - p.x, p.z);
-  float d = sdRoundCone(coneP, 0.03 * fade, baseR * fade, uConeLength);
-  float apexW = clamp(1.0 - (coneOX - p.x) / uConeLength, 0.0, 1.0);
+  // baseR unused (kept for call-site stability); the cone below is infinite.
+  float behind = coneOX - p.x; // >0 trailing the bullet
+  float halfA = radians(uConeAngleDeg * 0.5);
+  float sa = sin(halfA);
+  float ca = cos(halfA);
+  float r = length(vec2(p.y, p.z));
+  float t = r * sa + behind * ca;
+  // Exact flank distance where the perpendicular foot lands on the surface,
+  // apex distance otherwise. Under-reports slightly off-flank: safe for
+  // marching (conservative steps), exact sign everywhere.
+  float d = (t <= 0.0) ? length(vec2(r, behind)) : r * ca - behind * sa;
   vec3 rq = p * uRippleFreq + vec3(phase * TAU * 4.0, phase * TAU * 6.0, 0.0);
-  return d + cnoise(rq) * uRippleAmp * (0.35 + 0.65 * apexW) * fade;
+  return d + cnoise(rq) * uRippleAmp * fade;
 }
 
 // Smoke density 0..~1: soft ball falloff shaped by fbm billows,
@@ -612,6 +693,26 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
     float sb = (dCone - 0.12) * 9.0;
     shell = exp(-sb * sb) * fade;
   }
+  // Wake trail frame (shared by the heat envelope below and the carve
+  // further down): flared at the cone angle so the trail continues the
+  // shock-cone surface with no radius step at the junction.
+  float trailTan = tan(radians(uConeAngleDeg * 0.5));
+  float trailR0 = 0.08;
+  float trailAx1 = coneOX + 0.29;
+  // Lingering wake heat: analytic age since the nose passed this x-station
+  // (straight constant-speed flight inverts exactly: no memory needed).
+  // No attenuation: visited trail holds full heat until the loop restarts;
+  // unvisited air (including everything behind spawn) stays cold.
+  // Feeds glow, churn, suppression and shimmer like live heat.
+  if (fade > 0.0) {
+    float noseX0 = SMOKE_CENTER.x - uShapeSize + 0.14;
+    float tPass = 0.5 + (p.x - noseX0) / 3.2;
+    float age = phase * LOOP_DURATION - tPass;
+    if (age > 0.0 && tPass > 0.4 && p.x < coneOX + 0.39) {
+      float rr = length(p.yz) / max(trailR0 + max(trailAx1 - p.x, 0.0) * trailTan, 0.08);
+      heat += exp(-rr * rr) * fade;
+    }
+  }
   float r = length(p - SMOKE_CENTER) / gRadius;
   if (r > 1.35) {
     return vec2(0.0, heat);
@@ -623,7 +724,30 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   float rl = length(radial);
   vec3 rdir = rl > 0.0001 ? radial / rl : vec3(0.0, 1.0, 0.0);
   // Fixed noise space: xyz is static, only the 4th coordinate (time) moves.
-  vec3 q = (p - SMOKE_CENTER + rdir * (pushBand * uPush * 0.6)) * uNoiseFrequency;
+  // Billow domain rotates with the shape; shock push stays world-fixed.
+  vec3 sp = gRotInv * (p - SMOKE_CENTER);
+  // Persistent wake distance (reused for carving below).
+  vec3 conePt = vec3(p.y, trailAx1 - p.x, p.z);
+  float trailBackLen = trailAx1 - (SMOKE_CENTER.x - uShapeSize - 0.2);
+  float trailR1 = (trailR0 + trailBackLen * trailTan) * fade;
+  float dTrail = (fade > 0.0)
+    ? sdRoundCone(conePt, trailR0 * fade, trailR1, max(trailBackLen, 0.01))
+    : 1e5;
+  // Residual bullet wind: circular drift (constant speed, never stalls;
+  // integer cycles keep the loop seamless), boosted inside the wake so the
+  // smoke animates until end of loop.
+  float wakeProx = exp(-pow(max(dTrail, 0.0) * 2.5, 2.0));
+  float wAng = loopPhase() * TAU;
+  vec3 windOff = vec3(cos(wAng), 0.35 * sin(wAng * 2.0), sin(wAng))
+    * (0.12 + wakeProx * (0.25 + uNoiseSpeed * 0.6));
+  // Stream smoke out of the cone void (empties it) + wake-confined circular
+  // swirl (one seamless turn per loop; zero outside the wake so the noise
+  // space stays fixed elsewhere).
+  float coneClear = (1.0 - smoothstep(-0.06, 0.15, dCone)) * fade;
+  float swS = sin(wAng);
+  float swC = cos(wAng);
+  vec2 spSwirl = mix(sp.yz, mat2(swC, swS, -swS, swC) * sp.yz, clamp(wakeProx, 0.0, 1.0));
+  vec3 q = (vec3(sp.x, spSwirl.x, spSwirl.y) + rdir * (pushBand * uPush * 0.6 + coneClear * 0.5) + windOff) * uNoiseFrequency;
   // 4th dimension = loop-safe noise-time: swings out and back every loop,
   // so the last frame wraps seamlessly while the pattern truly evolves.
   float wAmp = 0.15 + 0.85 * uNoiseSpeed;
@@ -655,7 +779,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   float compression = shell * 1.2 + stag * 0.8 - coreRare * 0.9;
   dens *= clamp(1.0 + uPush * compression, 0.0, 3.0);
   // Only the hot core itself is deleted.
-  dens *= smoothstep(-0.06, 0.06, dCone);
+  dens *= mix(1.0, smoothstep(-0.06, 0.06, dCone), fade);
   // Bow-shock channel ahead of the nose: cleared air the bullet flies in,
   // so it stays visible through the cloud (faded with the bullet).
   if (fade > 0.0) {
@@ -668,6 +792,10 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
     float dBow = sdCapsule(p, tail, noseTip, 0.26 * fade);
     dens *= mix(1.0, smoothstep(-0.05, 0.12, dBow), fade);
   }
+  // Persistent wake trail: everything the nose has passed stays deleted
+  // until the loop restarts (when the bullet teleports home the trail
+  // collapses with it). Gated by fade so nothing carves pre-pass.
+  dens *= mix(1.0, smoothstep(-0.06, 0.10, dTrail), fade);
   return vec2(max(dens, 0.0), heat);
 }
 
@@ -688,6 +816,40 @@ vec2 intersectSmokeBounds(vec3 ro, vec3 rd, float Rb) {
   }
   h = sqrt(h);
   return vec2(-b - h, -b + h);
+}
+
+// Analytic ray vs hot wake tube around the flight axis (slab x0..x1,
+// radius rad). The volume march can't span 50 units at 24 steps, so the
+// glow beyond the smoke ball is integrated in closed form instead —
+// no step count, no distance cap. Returns (tEnter, tExit), empty = (1,-1).
+vec2 wakeInterval(vec3 ro, vec3 rd, float x0, float x1, float rad) {
+  float t0 = 0.0;
+  float t1 = uMaxDistance;
+  if (abs(rd.x) > 0.0001) {
+    float tx0 = (x0 - ro.x) / rd.x;
+    float tx1 = (x1 - ro.x) / rd.x;
+    t0 = max(t0, min(tx0, tx1));
+    t1 = min(t1, max(tx0, tx1));
+  } else if (ro.x < x0 || ro.x > x1) {
+    return vec2(1.0, -1.0);
+  }
+  float a = rd.y * rd.y + rd.z * rd.z;
+  if (a < 0.00000001) {
+    if (dot(ro.yz, ro.yz) > rad * rad) {
+      return vec2(1.0, -1.0);
+    }
+  } else {
+    float b = ro.y * rd.y + ro.z * rd.z;
+    float c = dot(ro.yz, ro.yz) - rad * rad;
+    float h = b * b - a * c;
+    if (h < 0.0) {
+      return vec2(1.0, -1.0);
+    }
+    h = sqrt(h);
+    t0 = max(t0, (-b - h) / a);
+    t1 = min(t1, (-b + h) / a);
+  }
+  return vec2(t0, t1);
 }
 
 // Procedural star field: sparse magnitude-weighted cells, night only.
@@ -849,6 +1011,8 @@ void main() {
   float coneOX;
   float baseR;
   loopState(phase, fade, bx, coneOX, baseR);
+  gRot = shapeRotMat(uShapeYaw, uShapePitch, uShapeRoll);
+  gRotInv = transpose3(gRot);
   float gg = clamp(uAnisotropy, -0.85, 0.85);
 
   // --- Build camera basis ---
@@ -921,11 +1085,19 @@ void main() {
     prevD = s.x;
     prevT = t;
     // abs(): inside, |d| still bounds the forward distance (never step back).
-    float stepO = abs(s.x) * relaxO;
+    // Sphere chunks march near-relaxed (smooth rigid pieces converge fast);
+    // bullet/slab keep the conservative global factor.
+    float rlx = (uMode > 0.5 && s.y > 2.5) ? 0.9 : relaxO;
+    float stepO = abs(s.x) * rlx;
     if (abs(s.x) < 1.0) {
       // Tighter cap once shattered: chunk borders are discontinuous, and big
       // steps across them leak rays (flicker / phantom bridges between pieces).
-      float nearCap = (uMode > 0.5 && tSince > 0.001) ? 0.12 : 0.3;
+      // Resolution-aware: never step over the local cell size (crater rubble
+      // needs finer steps than far plates).
+      float nearCap = 0.3;
+      if (uMode > 0.5 && tSince > 0.001) {
+        nearCap = min(0.12, 0.6 / shardFreqAt(gRotInv * (p - SMOKE_CENTER)));
+      }
       stepO = min(stepO, nearCap); // never jump the thin slab near a surface
     }
     t += stepO;
@@ -949,6 +1121,16 @@ void main() {
     }
   }
 
+  // --- Wake glow beyond the smoke ball (analytic segment, uncapped) ---
+  // The volume march covers only the ball; the hot trail runs ~50 units.
+  float wlen = 0.0;
+  if (uMode < 0.5 && fade > 0.0) {
+    vec2 wt = wakeInterval(rayOrigin, rayDirection,
+      SMOKE_CENTER.x - uShapeSize - 0.2, coneOX + 0.29, 0.5);
+    float tBallExit = (bounds.x >= 0.0 || bounds.y > 0.0) ? max(bounds.y, 0.0) : 0.0;
+    wlen = max(min(wt.y, uMaxDistance) - max(wt.x, tBallExit), 0.0);
+    heatOD += wlen * 0.15;
+  }
   // --- Heat shimmer: hot-air column wobbles the background lookup ---
   float heatN = clamp(heatOD * 2.5, 0.0, 1.0);
   float shimmer = 0.10 * uHeatStrength * heatN;
@@ -975,6 +1157,8 @@ void main() {
     }
   } else {
     color = vol.rgb + vol.a * bg;
+    // Saturated wake emission (bounded: never blows up down a long tube).
+    color += vol.a * uHeatColor * (uHeatStrength * 0.35) * (1.0 - exp(-wlen * 0.8)) * fade;
   }
 
   // NOTE: no tb-vs-bounds gate on purpose. The volume already stops at
@@ -1055,14 +1239,14 @@ void main() {
       vec3 hvec = normalize(lightDir - rayDirection + vec3(1e-4));
       float ndh = max(dot(n, hvec), 0.0);
       float spec = pow(ndh, 120.0);
-      float clear = pow(ndh, 900.0);
+      float clear = pow(ndh, 250.0);
       float fresS = pow(1.0 - clamp(dot(-rayDirection, n), 0.0, 1.0), 5.0);
       vec3 scol = albedo * (0.12 + diffuseFactor) * uLightColor * uLightIntensity
         + vec3(1.0) * spec * 1.1
         + vec3(1.0) * clear * 2.0
         + albedo * fresS * 0.6;
       // Dark crack lines along the moved partition borders.
-      float crack = (1.0 - smoothstep(0.0, max(gapHalfWidth(tSince, shardFreqAt(hitPos)) * 1.5, 0.004), hitBorder))
+      float crack = (1.0 - smoothstep(0.0, max(gapHalfWidth(tSince, shardFreqAt(gRotInv * (hitPos - SMOKE_CENTER))) * 1.5, 0.004), hitBorder))
         * clamp(tSince * 2.0, 0.0, 1.0);
       scol *= 1.0 - crack * 0.8;
       color = vol.rgb + vol.a * scol;

@@ -1,9 +1,5 @@
 <template>
   <div class="raymarch-container">
-    <div class="mode-toggle">
-      <button :class="{ active: config.mode === 'cloud' }" @click="config.mode = 'cloud'">Cloud</button>
-      <button :class="{ active: config.mode === 'sphere' }" @click="config.mode = 'sphere'">Sphere</button>
-    </div>
     <canvas ref="canvasRef" class="raymarch-canvas"></canvas>
 
     <!-- Minimal debug / info UI. Values mirror the uniforms below;
@@ -22,15 +18,43 @@
 
     <!-- Live controls (bound directly to shader uniforms). -->
     <div class="controls">
+      <div class="controls-title">Shape</div>
+      <label class="ctl">
+        <span>Shape</span>
+        <select v-model="config.mode" class="debug-select">
+          <option value="cloud">Cloud</option>
+          <option value="sphere">Sphere</option>
+          <option value="cube">Cube</option>
+        </select>
+      </label>
+      <label class="ctl">
+        <span>Size <code>{{ config.size.toFixed(2) }}</code></span>
+        <input type="range" min="1" max="2.5" step="0.05" v-model.number="config.size" />
+      </label>
+      <label class="ctl">
+        <span>Yaw <code>{{ config.shapeYaw.toFixed(0) }}°</code></span>
+        <input type="range" min="-180" max="180" step="1" v-model.number="config.shapeYaw" />
+      </label>
+      <label class="ctl">
+        <span>Pitch <code>{{ config.shapePitch.toFixed(0) }}°</code></span>
+        <input type="range" min="-180" max="180" step="1" v-model.number="config.shapePitch" />
+      </label>
+      <label class="ctl">
+        <span>Roll <code>{{ config.shapeRoll.toFixed(0) }}°</code></span>
+        <input type="range" min="-180" max="180" step="1" v-model.number="config.shapeRoll" />
+      </label>
+      <div class="controls-title">Bullet</div>
+      <label class="ctl">
+        <span>Speed <code>{{ config.bulletSpeed.toFixed(1) }}</code></span>
+        <input type="range" min="0.5" max="8" step="0.1" v-model.number="config.bulletSpeed" />
+      </label>
+      <div v-if="config.mode === 'cloud'">
       <div class="controls-title">Smoke</div>
       <label class="ctl">
         <span>Density <code>{{ config.smokeDensity.toFixed(2) }}</code></span>
         <input type="range" min="0" max="2" step="0.05" v-model.number="config.smokeDensity" />
       </label>
-      <label class="ctl">
-        <span>Radius <code>{{ config.smokeRadius.toFixed(2) }}</code></span>
-        <input type="range" min="1" max="2.5" step="0.05" v-model.number="config.smokeRadius" />
-      </label>
+      <!-- size moved to the Shape section above -->
       <label class="ctl">
         <span>Billow <code>{{ config.noiseAmplitude.toFixed(2) }}</code></span>
         <input type="range" min="0" max="0.8" step="0.01" v-model.number="config.noiseAmplitude" />
@@ -59,6 +83,7 @@
         <span>Flow speed <code>{{ config.noiseSpeed.toFixed(2) }}</code></span>
         <input type="range" min="0" max="1.5" step="0.05" v-model.number="config.noiseSpeed" />
       </label>
+      </div>
       <div class="controls-title">Shockwave</div>
       <label class="ctl">
         <span>Cone angle <code>{{ config.coneAngle.toFixed(1) }}°</code></span>
@@ -111,13 +136,9 @@
           <option value="cone">Cone SDF</option>
         </select>
       </label>
-      <div class="controls-title">Sphere</div>
-      <div class="controls-note" v-if="config.mode !== 'sphere'">Switch to Sphere mode above.</div>
-      <label class="ctl" v-if="config.mode === 'sphere'">
-        <span>Shard scale <code>{{ config.shardFreq.toFixed(1) }}</code></span>
-        <input type="range" min="1" max="6" step="0.1" v-model.number="config.shardFreq" />
-      </label>
-      <label class="ctl" v-if="config.mode === 'sphere'">
+      <div class="controls-title">Shatter</div>
+      <div class="controls-note" v-if="config.mode === 'cloud'">Switch to a solid mode above.</div>
+      <label class="ctl" v-if="config.mode !== 'cloud'">
         <span>Min shard <code>{{ config.shardMin.toFixed(2) }}</code></span>
         <input type="range" min="0.02" max="0.5" step="0.01" v-model.number="config.shardMin" />
       </label>
@@ -194,8 +215,12 @@ const config = reactive({
   sunColor: '#fff3e0',
   skyColor: '#4a7ec2',
   flare: 1.2,
-  // Smoke puff.
-  smokeRadius: 1.7,
+  // Master shape size + object rotation (generic for smoke / sphere / cube).
+  size: 1.7,
+  shapeYaw: 0.0, // degrees
+  shapePitch: 0.0,
+  shapeRoll: 0.0,
+  bulletSpeed: 3.2, // world units/s; drives flight + chunk motion
   smokeDensity: 2.0,
   // Perlin billows.
   noiseAmplitude: 0.8,
@@ -211,7 +236,6 @@ const config = reactive({
   rippleFreq: 9.0,
   push: 1.5,
   mode: 'cloud', // 'cloud' volumetric smoke | 'sphere' plastic shatter sphere
-  shardFreq: 2.5, // voronoi cell density
   shardMin: 0.1, // smallest shard, world units
   // Ground slab perturbation (near-camera Perlin, far stays flat).
   groundAmp: 0.08,
@@ -369,7 +393,11 @@ function cacheUniformLocations() {
     'uCameraUp',
     'uCameraFov',
     'uAspectRatio',
-    'uSmokeRadius',
+    'uShapeSize',
+    'uShapeYaw',
+    'uShapePitch',
+    'uShapeRoll',
+    'uBulletSpeed',
     'uSmokeDensity',
     'uSmokeColor',
     'uScatter',
@@ -392,7 +420,6 @@ function cacheUniformLocations() {
     'uGroundOct',
     'uGroundLac',
     'uMode',
-    'uShardFreq',
     'uShardMin',
     'uShowGround',
     'uDebugMode',
@@ -430,7 +457,11 @@ function setPerFrameUniforms(timeSeconds) {
   if (u.uAspectRatio) gl.uniform1f(u.uAspectRatio, canvas.width / canvas.height)
   if (u.uResolution) gl.uniform2f(u.uResolution, canvas.width, canvas.height)
   // Scene uniforms are set every frame so the sliders take effect live.
-  if (u.uSmokeRadius) gl.uniform1f(u.uSmokeRadius, config.smokeRadius)
+  if (u.uShapeSize) gl.uniform1f(u.uShapeSize, config.size)
+  if (u.uShapeYaw) gl.uniform1f(u.uShapeYaw, (config.shapeYaw * Math.PI) / 180)
+  if (u.uShapePitch) gl.uniform1f(u.uShapePitch, (config.shapePitch * Math.PI) / 180)
+  if (u.uShapeRoll) gl.uniform1f(u.uShapeRoll, (config.shapeRoll * Math.PI) / 180)
+  if (u.uBulletSpeed) gl.uniform1f(u.uBulletSpeed, config.bulletSpeed)
   if (u.uSmokeDensity) gl.uniform1f(u.uSmokeDensity, config.smokeDensity)
   if (u.uNoiseAmplitude) gl.uniform1f(u.uNoiseAmplitude, config.noiseAmplitude)
   if (u.uNoiseFrequency) gl.uniform1f(u.uNoiseFrequency, config.noiseFrequency)
@@ -449,8 +480,8 @@ function setPerFrameUniforms(timeSeconds) {
     gl.uniform1i(u.uGroundOct, Math.max(1, Math.min(8, Math.round(config.groundOct))))
   }
   if (u.uGroundLac) gl.uniform1f(u.uGroundLac, config.groundLac)
-  if (u.uMode) gl.uniform1f(u.uMode, config.mode === 'sphere' ? 1 : 0)
-  if (u.uShardFreq) gl.uniform1f(u.uShardFreq, config.shardFreq)
+  const SHAPE_MODES = { cloud: 0, sphere: 1, cube: 2 }
+  if (u.uMode) gl.uniform1f(u.uMode, SHAPE_MODES[config.mode] ?? 0)
   if (u.uShardMin) gl.uniform1f(u.uShardMin, config.shardMin)
   if (u.uShowGround) gl.uniform1f(u.uShowGround, config.showGround ? 1 : 0)
   const DEBUG_MODES = { off: 0, compression: 1, heat: 2, density: 3, cone: 4 }
@@ -854,38 +885,6 @@ onUnmounted(() => {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 6px;
   cursor: pointer;
-}
-
-.mode-toggle {
-  position: absolute;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex;
-  gap: 4px;
-  padding: 4px;
-  font-family: ui-monospace, monospace;
-  font-size: 12px;
-  background: rgba(8, 12, 24, 0.72);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
-  backdrop-filter: blur(4px);
-  z-index: 5;
-}
-
-.mode-toggle button {
-  font: inherit;
-  color: #d7e0f0;
-  background: transparent;
-  border: 0;
-  border-radius: 6px;
-  padding: 6px 14px;
-  cursor: pointer;
-}
-
-.mode-toggle button.active {
-  background: #2c4a7a;
-  color: #fff;
 }
 
 .loop-track {
