@@ -98,10 +98,12 @@ const int MAX_STEPS = 64;
 const int VOL_STEPS = 24; // 4D noise costs ~2x per step vs 3D; dither hides the cut
 const int MAX_OCTAVES = 8;
 const float LOOP_DURATION = 16.0;
-const float BULLET_WINDOW = 0.125; // one 2 s pass per loop: 4x bullet speed
+const float EXPAND = 0.5; // smoke expansion phase each loop (seconds)
+float gRadius = 1.0; // effective smoke/sphere radius after expansion envelope
 const float TAU = 6.2831853;
 const float BULLET_X1 = 3.2;
 const float BULLET_RADIUS = 0.14;
+const float BULLET_MIN_VIS = 0.4; // readability floor, see bullet branch
 const vec3 SMOKE_CENTER = vec3(0.0, 0.0, 0.0);
 // Square ground slab under the smoke: 8x8 footprint, thin 0.25 thickness.
 const vec3 GROUND_HALF = vec3(4.0, 0.125, 4.0);
@@ -337,7 +339,13 @@ void loopState(out float phase, out float fade, out float bx, out float coneOX, 
   phase = loopPhase();
   // Single blazing pass per loop: spawn in contact, cross while phase <
   // window, parked invisible (fade 0) the rest of the loop.
-  float w = min(phase / BULLET_WINDOW, 1.0);
+  // Bullet clock: parked during the 0.5 s smoke expansion, then one pass.
+  // Smoke radius ramps 0 -> full over EXPAND (and back down at the wrap
+  // so the loop stays seamless); floor keeps every 1/R term finite.
+  float loopT = phase * LOOP_DURATION;
+  gRadius = uSmokeRadius * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(LOOP_DURATION - EXPAND, LOOP_DURATION, loopT)), 0.001);
+  float bulletT = max(loopT - EXPAND, 0.0);
+  float w = min(bulletT / 2.0, 1.0);
   fade = smoothstep(0.0, 0.08, w) * (1.0 - smoothstep(0.92, 1.0, w));
   // Spawn in contact: shape_position - flight_dir * shape_radius.
   float bx0 = SMOKE_CENTER.x - uSmokeRadius;
@@ -436,10 +444,10 @@ vec4 voronoi(vec3 p, out vec3 feat) {
 // uShardMin floors the piece size as a safety cap.
 float shardFreqAt(vec3 p) {
   vec3 rel = p - SMOKE_CENTER;
-  float dI = length(rel - vec3(-uSmokeRadius, 0.0, 0.0));
+  float dI = length(rel - vec3(-gRadius, 0.0, 0.0));
   // Far field settles to ~4 coarse plates; the crater term subdivides down
   // to rubble as distance -> 0.
-  float far = smoothstep(0.0, 2.0 * uSmokeRadius, dI);
+  float far = smoothstep(0.0, 2.0 * gRadius, dI);
   float crater = 1.0 - far;
   float freq = uShardFreq * (mix(1.0, 0.18, far) + crater * crater * 2.5);
   return min(freq, 1.0 / max(uShardMin, 0.02));
@@ -473,7 +481,7 @@ float gBorderW = 10.0;
 
 float sphereShatterSDF(vec3 p, float tSince) {
   if (tSince <= 0.0) {
-    return sdSphere(p - SMOKE_CENTER, uSmokeRadius);
+    return sdSphere(p - SMOKE_CENTER, gRadius);
   }
   vec3 rel = p - SMOKE_CENTER;
   float freq = shardFreqAt(p);
@@ -481,7 +489,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // so distant samples return a valid bound with zero voronoi cost.
   // (This is also what restores full speed: most march steps exit here.)
   float reach = 3.5 / freq + 0.3;
-  float dFar = length(rel) - uSmokeRadius - reach;
+  float dFar = length(rel) - gRadius - reach;
   if (dFar > 0.0) {
     return dFar;
   }
@@ -542,7 +550,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   float ang = 0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince;
   mat3 Ri = rotAxisAngle(ax, -ang);
   vec3 q = pivot + Ri * (p - pivot - T);
-  float dChunk = sdSphere(q - SMOKE_CENTER, uSmokeRadius);
+  float dChunk = sdSphere(q - SMOKE_CENTER, gRadius);
   // Borders are tested in the chunk frame (they move with the pieces): a
   // second voronoi at q keeps the carve glued to the rotating chunks, so no
   // ghost shell lingers in the gaps and no static grid slices the pieces.
@@ -554,7 +562,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // Far-field bound: a rotated/translated chunk field under-reports distance
   // far away (phantom shapes, e.g. along the flight axis). Clamp it to a
   // bounding sphere of the debris; near chunks are unaffected.
-  return max(dOpen, length(rel) - (uSmokeRadius + 4.5));
+  return max(dOpen, length(rel) - (gRadius + 4.5));
 }
 
 vec2 opaqueScene(vec3 p, vec3 ro, float bx, float fade, float tSince) {
@@ -604,7 +612,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
     float sb = (dCone - 0.12) * 9.0;
     shell = exp(-sb * sb) * fade;
   }
-  float r = length(p - SMOKE_CENTER) / uSmokeRadius;
+  float r = length(p - SMOKE_CENTER) / gRadius;
   if (r > 1.35) {
     return vec2(0.0, heat);
   }
@@ -867,7 +875,7 @@ void main() {
   // Spawn puts the bullet center exactly on the surface: impact at t = 0.
   // Debris motion capped at 6.3 s (all validity bounds hold), then held
   // while smoke and loop continue to 16 s.
-  float tSince = min(phase * LOOP_DURATION, 6.3);
+  float tSince = min(max(phase * LOOP_DURATION - EXPAND, 0.0), 6.3);
   float tb = uMaxDistance;
   bool opaqueHit = false;
   float hitMat = 0.0;
@@ -927,7 +935,7 @@ void main() {
   }
 
   // --- Volume march (cloud mode only; sphere mode has no smoke) ---
-  float Rb = uSmokeRadius * 1.35 + uNoiseAmplitude + 0.3;
+  float Rb = gRadius * 1.35 + uNoiseAmplitude + 0.3;
   vec2 bounds = intersectSmokeBounds(rayOrigin, rayDirection, Rb);
   float heatOD = 0.0;
   float dummyHit = 0.0;
@@ -989,7 +997,11 @@ void main() {
         + vec3(0.45, 0.5, 0.6) * diffuseFactor * 0.7 * uLightIntensity
         + uLightColor * spec * 1.5
         + uHeatColor * rim * 0.4;
-      color = vol.rgb + vol.a * bulletCol;
+      // Readability floor: smoke between camera and bullet absorbs it to a
+      // few percent (Beer-Lambert at density 2), so without this the bullet
+      // vanishes inside the cloud from most angles/distances. The floor
+      // keeps it rendered everywhere; thin smoke is unaffected (vol.a ~ 1).
+      color = vol.rgb + max(vol.a, BULLET_MIN_VIS) * bulletCol;
     } else if (hitMat < 2.5) {
       // --- Ground slab: diffuse + traced smoke reflection + thin-slab refraction ---
       vec3 n = groundNormal(hitPos, rayOrigin);
