@@ -5,7 +5,7 @@
 // from the smoke (carved tunnel with rippled walls): it suppresses the
 // smoke, turbules it, makes it glow, and shimmers the background behind it
 // like hot air. The bullet is a simple sphere — the only opaque SDF.
-// Everything loops seamlessly every LOOP_DURATION.
+// Everything loops seamlessly every uLoopDuration.
 //
 // Techniques:
 //   - Camera ray per-pixel from camera uniforms (position + basis + FOV).
@@ -97,11 +97,11 @@ uniform float uLightIntensity;
 uniform float uTime;        // elapsed seconds (looped every 16 s; bullet: 8 s sub-loop)
 uniform vec2 uResolution;   // drawing-buffer size in pixels (reserved)
 
-// Constants (LOOP_DURATION must match LOOP_SECONDS in RaymarchCanvas.vue).
+// Constants (uLoopDuration is set live from the Loop slider).
 const int MAX_STEPS = 64;
 const int VOL_STEPS = 24; // 4D noise costs ~2x per step vs 3D; dither hides the cut
 const int MAX_OCTAVES = 8;
-const float LOOP_DURATION = 16.0;
+uniform float uLoopDuration; // seconds per loop (live slider; all phases stay seamless)
 const float EXPAND = 0.5; // smoke expansion phase each loop (seconds)
 float gRadius = 1.0; // effective smoke/sphere radius after expansion envelope
 mat3 gRot;     // object rotation for this pixel (set in main)
@@ -377,7 +377,7 @@ float fbm4(vec4 p, int octaves, float lacunarity, float gain) {
 // All animation derives from the loop phase with INTEGER cycle counts or a
 // circular domain offset, so the last frame wraps seamlessly to the first.
 float loopPhase() {
-  return fract(uTime / LOOP_DURATION);
+  return fract(uTime / uLoopDuration);
 }
 
 float bulletX(float phase) {
@@ -390,8 +390,8 @@ void loopState(out float phase, out float fade, out float bx, out float coneOX, 
   // at constant speed with no fade-outs until the loop restarts there.
   // Smoke radius ramps 0 -> full over EXPAND (and back down at the wrap
   // so the loop stays seamless); floor keeps every 1/R term finite.
-  float loopT = phase * LOOP_DURATION;
-  gRadius = uShapeSize * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(LOOP_DURATION - EXPAND, LOOP_DURATION, loopT)), 0.001);
+  float loopT = phase * uLoopDuration;
+  gRadius = uShapeSize * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(uLoopDuration - EXPAND, uLoopDuration, loopT)), 0.001);
   vec3 bpos = bulletSpawn() + BULLET_DIR * (uBulletSpeed * bulletClock(loopT));
   bx = bpos.x;
   fade = bulletFade(loopT);
@@ -707,7 +707,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   if (fade > 0.0) {
     float noseX0 = SMOKE_CENTER.x - uShapeSize + 0.14;
     float tPass = 0.5 + (p.x - noseX0) / 3.2;
-    float age = phase * LOOP_DURATION - tPass;
+    float age = phase * uLoopDuration - tPass;
     if (age > 0.0 && tPass > 0.4 && p.x < coneOX + 0.39) {
       float rr = length(p.yz) / max(trailR0 + max(trailAx1 - p.x, 0.0) * trailTan, 0.08);
       heat += exp(-rr * rr) * fade;
@@ -1039,7 +1039,7 @@ void main() {
   // Spawn puts the bullet center exactly on the surface: impact at t = 0.
   // Debris clock runs uncapped to end of loop (translation/gaps saturate
   // on their own; spin stays within validity, hard-capped only as safety).
-  float tSince = max(phase * LOOP_DURATION - EXPAND, 0.0);
+  float tSince = max(phase * uLoopDuration - EXPAND, 0.0);
   float tb = uMaxDistance;
   bool opaqueHit = false;
   float hitMat = 0.0;

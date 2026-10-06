@@ -18,6 +18,11 @@
 
     <!-- Live controls (bound directly to shader uniforms). -->
     <div class="controls">
+      <div class="controls-title">Loop</div>
+      <label class="ctl">
+        <span>Duration <code>{{ config.loopDuration.toFixed(0) }}s</code></span>
+        <input type="range" min="4" max="16" step="1" v-model.number="config.loopDuration" />
+      </label>
       <div class="controls-title">Shape</div>
       <label class="ctl">
         <span>Shape</span>
@@ -197,11 +202,12 @@ import fragSource from '../shaders/raymarch.frag?raw'
 // Scene / smoke / shockwave configuration (live uniforms via sliders below).
 // MARCH_STEPS lives in the shader as a const; keep maxSteps in sync.
 // ---------------------------------------------------------------------------
-const LOOP_SECONDS = 16.0 // must match LOOP_DURATION in the fragment shader
+// (loop duration now lives in config.loopDuration, uploaded as uLoopDuration)
 const config = reactive({
   maxSteps: 64,
   epsilon: 0.004,
   maxDistance: 200.0, // far raymarch cutoff (was clipping distant geometry)
+  loopDuration: 8, // seconds per loop (uploaded as uLoopDuration)
   // Orbit camera, always looking at the SDF center (SMOKE_CENTER in shader).
   // A/D orbit yaw, W/S orbit pitch, Q/E dolly. Arrow keys mirror WASD.
   camYaw: -1.157, // radians (matches [-2.89, -0.13, 1.27] at dist 3.16)
@@ -432,6 +438,7 @@ function cacheUniformLocations() {
     'uLightColor',
     'uLightIntensity',
     'uTime',
+    'uLoopDuration',
     'uResolution',
   ]
   for (const name of names) {
@@ -454,6 +461,7 @@ function setPerFrameUniforms(timeSeconds) {
   const canvas = canvasRef.value
   const u = uniformLocations
   if (u.uTime) gl.uniform1f(u.uTime, timeSeconds)
+  if (u.uLoopDuration) gl.uniform1f(u.uLoopDuration, config.loopDuration)
   if (u.uAspectRatio) gl.uniform1f(u.uAspectRatio, canvas.width / canvas.height)
   if (u.uResolution) gl.uniform2f(u.uResolution, canvas.width, canvas.height)
   // Scene uniforms are set every frame so the sliders take effect live.
@@ -581,12 +589,12 @@ function frame(now) {
   updateCamera(dt)
   setPerFrameUniforms(elapsed)
   // 16 s loop progress (direct DOM write to avoid re-rendering every frame).
-  const loopPhase = (elapsed % LOOP_SECONDS) / LOOP_SECONDS
+  const loopPhase = (elapsed % config.loopDuration) / config.loopDuration
   if (loopBarRef.value) {
     loopBarRef.value.style.transform = `scaleX(${loopPhase})`
   }
   if (phaseEl.value) {
-    phaseEl.value.textContent = `${(loopPhase * LOOP_SECONDS).toFixed(1)}s / ${LOOP_SECONDS.toFixed(0)}s`
+    phaseEl.value.textContent = `${(loopPhase * config.loopDuration).toFixed(1)}s / ${config.loopDuration.toFixed(0)}s`
   }
   gl.drawArrays(gl.TRIANGLES, 0, 3)
   rafId = requestAnimationFrame(frame)
