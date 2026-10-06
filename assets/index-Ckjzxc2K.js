@@ -45,7 +45,10 @@ uniform float uCameraFov;       // vertical field of view, degrees
 uniform float uAspectRatio;    // canvasWidth / canvasHeight
 
 // --- Smoke medium uniforms ---
-uniform float uSmokeRadius;    // base radius of the smoke puff
+uniform float uShapeSize;      // master size: smoke/sphere radius, cube bounding radius
+uniform float uShapeYaw;       // object rotation, radians (yaw about Y)
+uniform float uShapePitch;     // object rotation, radians (pitch about X)
+uniform float uShapeRoll;      // object rotation, radians (roll about Z)
 uniform float uSmokeDensity;   // extinction scale (absorption + scattering)
 uniform vec3 uSmokeColor;      // smoke albedo / body colour
 uniform float uScatter;        // directional scattering brightness
@@ -79,9 +82,10 @@ uniform int uGroundOct;        // perturbation octave count, 1..MAX_OCTAVES
 uniform float uGroundLac;      // perturbation frequency multiplier per octave
 
 // --- Sphere shatter mode uniforms ---
-uniform float uMode;           // 0 = smoke cloud, 1 = plastic sphere
-uniform float uShardFreq;      // voronoi cell density (shard size ~ 1/freq)
+uniform float uMode;           // 0 = smoke cloud, 1 = plastic sphere, 2 = plastic cube
+// shard scale fixed at 1.0; max shard fixed at 5.0 (see shardFreqAt)
 uniform float uShardMin;       // smallest allowed shard, world units (hard cap)
+// (decl merged above)
 
 // --- Visibility & debug uniforms ---
 uniform float uShowGround;     // 0 = plane hidden, 1 = visible
@@ -113,11 +117,56 @@ const int MAX_OCTAVES = 8;
 const float LOOP_DURATION = 16.0;
 const float EXPAND = 0.5; // smoke expansion phase each loop (seconds)
 float gRadius = 1.0; // effective smoke/sphere radius after expansion envelope
+mat3 gRot;     // object rotation for this pixel (set in main)
+mat3 gRotInv;  // its transpose = inverse (rotation is orthogonal)
+
+// Generic object rotation: yaw (Y), then pitch (X), then roll (Z).
+mat3 shapeRotMat(float yaw, float pitch, float roll) {
+  float cx = cos(pitch);
+  float sx = sin(pitch);
+  float cy = cos(yaw);
+  float sy = sin(yaw);
+  float cz = cos(roll);
+  float sz = sin(roll);
+  mat3 rx = mat3(1.0, 0.0, 0.0, 0.0, cx, sx, 0.0, -sx, cx);
+  mat3 ry = mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
+  mat3 rz = mat3(cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0);
+  return ry * rx * rz;
+}
+
+// Transpose (GLSL ES 1.00 has no transpose() builtin). For rotation
+// matrices this is the inverse.
+mat3 transpose3(mat3 m) {
+  return mat3(m[0][0], m[1][0], m[2][0],
+              m[0][1], m[1][1], m[2][1],
+              m[0][2], m[1][2], m[2][2]);
+}
 const float TAU = 6.2831853;
 const float BULLET_X1 = 3.2;
 const float BULLET_RADIUS = 0.14;
+// (bullet rig lives below SMOKE_CENTER; GLSL needs declaration order)
 const float BULLET_MIN_VIS = 0.4; // readability floor, see bullet branch
 const vec3 SMOKE_CENTER = vec3(0.0, 0.0, 0.0);
+
+// ================= BULLET RIG (generic, shape-agnostic) =================
+// The ONLY bullet knowledge in the shader. Shapes consume pos/dir/speed/
+// fade and compute their own response (impact, shatter, carve), so the rig
+// applies unchanged to smoke, sphere, cube, or future shapes.
+const vec3 BULLET_DIR = vec3(1.0, 0.0, 0.0); // flight axis (+X)
+const float BULLET_REF_SPEED = 3.2;          // normalizes chunk motion
+uniform float uBulletSpeed;                  // world units per second (live)
+
+vec3 bulletSpawn() {
+  return vec3(SMOKE_CENTER.x - uShapeSize, 0.0, 0.0);
+}
+
+float bulletFade(float loopT) {
+  return smoothstep(0.0, EXPAND, loopT);
+}
+
+float bulletClock(float loopT) {
+  return max(loopT - EXPAND, 0.0); // seconds since launch
+}
 // Square ground slab under the smoke: 8x8 footprint, thin 0.25 thickness.
 const vec3 GROUND_HALF = vec3(4.0, 0.125, 4.0);
 const float SLAB_IOR = 1.3;
@@ -345,24 +394,20 @@ float loopPhase() {
 }
 
 float bulletX(float phase) {
-  return mix(SMOKE_CENTER.x - uSmokeRadius, BULLET_X1, phase);
+  return mix(SMOKE_CENTER.x - uShapeSize, BULLET_X1, phase);
 }
 
 void loopState(out float phase, out float fade, out float bx, out float coneOX, out float baseR) {
   phase = loopPhase();
-  // Single blazing pass per loop: spawn in contact, cross while phase <
-  // window, parked invisible (fade 0) the rest of the loop.
-  // Bullet clock: parked during the 0.5 s smoke expansion, then one pass.
+  // One bullet: frozen at spawn during smoke expansion, then flying straight
+  // at constant speed with no fade-outs until the loop restarts there.
   // Smoke radius ramps 0 -> full over EXPAND (and back down at the wrap
   // so the loop stays seamless); floor keeps every 1/R term finite.
   float loopT = phase * LOOP_DURATION;
-  gRadius = uSmokeRadius * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(LOOP_DURATION - EXPAND, LOOP_DURATION, loopT)), 0.001);
-  float bulletT = max(loopT - EXPAND, 0.0);
-  float w = min(bulletT / 2.0, 1.0);
-  fade = smoothstep(0.0, 0.08, w) * (1.0 - smoothstep(0.92, 1.0, w));
-  // Spawn in contact: shape_position - flight_dir * shape_radius.
-  float bx0 = SMOKE_CENTER.x - uSmokeRadius;
-  bx = mix(bx0, BULLET_X1, w);
+  gRadius = uShapeSize * max(smoothstep(0.0, EXPAND, loopT) * (1.0 - smoothstep(LOOP_DURATION - EXPAND, LOOP_DURATION, loopT)), 0.001);
+  vec3 bpos = bulletSpawn() + BULLET_DIR * (uBulletSpeed * bulletClock(loopT));
+  bx = bpos.x;
+  fade = bulletFade(loopT);
   coneOX = bx - 0.05;
   baseR = uConeLength * tan(radians(uConeAngleDeg * 0.5));
 }
@@ -381,8 +426,8 @@ float bulletSDF(vec3 p, float bx, float fade) {
 // sphere mode kisses the ball's underside, cloud mode clears the wispy extent.
 vec3 groundCenter() {
   float top = (uMode > 0.5)
-    ? -uSmokeRadius - 0.1
-    : -(uSmokeRadius * 1.35 + 0.2);
+    ? -uShapeSize - 0.1
+    : -(uShapeSize * 1.35 + 0.2);
   return vec3(0.0, top - GROUND_HALF.y, 0.0);
 }
 
@@ -455,22 +500,26 @@ vec4 voronoi(vec3 p, out vec3 feat) {
 // (With graded frequency the pivot is approximate to ~8% of a cell, a
 // static micro-bend, invisible next to the chunks themselves.)
 // uShardMin floors the piece size as a safety cap.
-float shardFreqAt(vec3 p) {
-  vec3 rel = p - SMOKE_CENTER;
-  float dI = length(rel - vec3(-gRadius, 0.0, 0.0));
+// Cell density grades with distance from the impact crater, evaluated in
+// OBJECT space (rel = shape-frame offset from center) so the dense zone
+// rotates with the shape. Frozen/static: impact-only, never time-varying.
+float shardFreqAt(vec3 rel) {
+  vec3 craterObj = gRotInv * vec3(-uShapeSize, 0.0, 0.0);
+  float dI = length(rel - craterObj);
   // Far field settles to ~4 coarse plates; the crater term subdivides down
   // to rubble as distance -> 0.
   float far = smoothstep(0.0, 2.0 * gRadius, dI);
   float crater = 1.0 - far;
-  float freq = uShardFreq * (mix(1.0, 0.18, far) + crater * crater * 2.5);
-  return min(freq, 1.0 / max(uShardMin, 0.02));
+  float freq = mix(1.0, 0.18, far) + crater * crater * 2.5;
+  freq = clamp(freq, 1.0 / 5.0, 1.0 / max(uShardMin, 0.02));
+  return freq;
 }
 
 // Gap half-width along partition borders: opens fast after impact, holds.
-// Scaled to the cell size so gaps read as empty at any shard frequency
-// without ever swallowing whole pieces.
+// Scaled to the cell size; opens softly (smoothstep, no hard cut) so gaps
+// read as empty at any shard frequency without swallowing whole pieces.
 float gapHalfWidth(float tSince, float freq) {
-  return min(tSince * 0.25, 0.175 / freq);
+  return (0.175 / freq) * smoothstep(0.0, 1.2, tSince);
 }
 
 // Proper rotation matrix (Rodrigues, column-major): det +1, orthogonal.
@@ -492,12 +541,22 @@ float coneField(vec3 p, float phase, float fade, float coneOX, float baseR);
 // Last chunk-frame border from marching (SDF -> shading handoff, below).
 float gBorderW = 10.0;
 
+// Generic solid in unit space: sphere, or cube whose bounding sphere is 1
+// (half extent 1/sqrt(3)), selected by uMode. World d = local * SIZE.
+float solidBaseSDF(vec3 pl) {
+  if (uMode < 1.5) {
+    return length(pl) - 1.0;
+  }
+  return sdBox(pl, vec3(0.5773503));
+}
+
 float sphereShatterSDF(vec3 p, float tSince) {
   if (tSince <= 0.0) {
-    return sdSphere(p - SMOKE_CENTER, gRadius);
+    return solidBaseSDF((gRotInv * (p - SMOKE_CENTER)) / gRadius) * gRadius;
   }
   vec3 rel = p - SMOKE_CENTER;
-  float freq = shardFreqAt(p);
+  vec3 obj = gRotInv * rel;
+  float freq = shardFreqAt(obj);
   // Cheap far exit: all debris stays within reach of the original shell,
   // so distant samples return a valid bound with zero voronoi cost.
   // (This is also what restores full speed: most march steps exit here.)
@@ -507,8 +566,8 @@ float sphereShatterSDF(vec3 p, float tSince) {
     return dFar;
   }
   vec3 feat;
-  vec4 v = voronoi((p - SMOKE_CENTER) * freq, feat);
-  vec3 pivot = p + feat * min(1.0 / freq, 0.75); // chunk centroid, offset clamped:
+  vec4 v = voronoi(obj * freq, feat);
+  vec3 pivot = obj + feat * min(1.0 / freq, 0.75); // chunk centroid, offset clamped:
   // far cells would otherwise place it units away, turning the whole chunk
   // frame (motion, normals, shading) into background speckle. Near-sphere
   // cells (freq > 1.33) are untouched.
@@ -517,7 +576,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // surface, so impact is at window start): chunk ballistics lock to
   // hit-time conditions, so every fragment keeps its exact dimensions
   // and shape for the whole animation.
-  float coneOX = SMOKE_CENTER.x - uSmokeRadius - 0.05;
+  float coneOX = SMOKE_CENTER.x - uShapeSize - 0.05;
   float baseR = uConeLength * tan(radians(uConeAngleDeg * 0.5));
   // Air pressure sampled ONCE at impact time from the SMOOTH base cone
   // (same shell/stagnation model as the smoke, minus ripple detail so
@@ -525,20 +584,21 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // tearing into jitter). Everything below derives from the pivot (never
   // from p or from live bullet state), so each chunk moves as one rigid
   // body: constant velocity, constant spin.
-  vec3 conePs = vec3(pivot.y, coneOX - pivot.x, pivot.z);
+  vec3 pW = SMOKE_CENTER + gRot * pivot; // chunk centroid back in world
+  vec3 conePs = vec3(pW.y, coneOX - pW.x, pW.z);
   float dCp = sdRoundCone(conePs, 0.03, baseR, uConeLength);
   float sbp = (dCp - 0.12) * 9.0;
   float shellp = exp(-sbp * sbp);
-  float sAh = pivot.x - (coneOX + 0.19);
+  float sAh = pW.x - (coneOX + 0.19);
   float qa = sAh / 0.35;
-  float qr = length(pivot.yz) / 0.30;
+  float qr = length(pW.yz) / 0.30;
   float stagp = (sAh > -0.1)
     ? exp(-(qa * qa + qr * qr)) * smoothstep(-0.1, 0.15, sAh)
     : 0.0;
   float press = shellp * 1.2 + stagp * 0.8
     - (1.0 - smoothstep(-0.35, 0.05, dCp)) * 0.9;
   float push = max(press, 0.0);
-  vec3 n0 = (pivot - SMOKE_CENTER) / max(length(pivot - SMOKE_CENTER), 0.001);
+  vec3 n0 = pivot / max(length(pivot), 0.001);
   vec3 R = reflect(vec3(1.0, 0.0, 0.0), n0);
   float facing = clamp(dot(n0, vec3(-1.0, 0.0, 0.0)), 0.0, 1.0);
   // Smoke-coupled flight: advect with the same shock flow that streams the
@@ -548,27 +608,40 @@ float sphereShatterSDF(vec3 p, float tSince) {
   // at any angle) provides the drama. All inputs frozen per chunk.
   float pb = dCp * 3.0;
   float flowBand = exp(-pb * pb);
-  vec3 coneR = vec3(0.0, pivot.y, pivot.z);
-  float crl = length(coneR);
-  vec3 radFlow = (crl > 0.0001) ? coneR / crl : vec3(0.0, 1.0, 0.0);
-  vec3 flowRaw = mix(radFlow, R, clamp(0.3 + facing * 0.7, 0.0, 1.0)) + rnd * 0.25;
-  vec3 flowDir = flowRaw / max(length(flowRaw), 0.05);
+  // Bullet-wave direction: mostly +X travel with a touch of reflection
+  // deflection; pieces translate rigidly (never distort) and rotate.
+  vec3 flyRaw = vec3(1.0, 0.0, 0.0) + R * (0.3 * facing) + rnd * 0.2;
+  vec3 flyDir = flyRaw / max(length(flyRaw), 0.05);
   float drive = clamp(push + facing * 0.5 + flowBand * uPush * 0.5, 0.0, 2.0);
-  float sepMax = (0.12 + 0.38 * (drive / 2.0)) / freq;
-  vec3 T = flowDir * (sepMax * (1.0 - exp(-tSince * 2.2)));
+  float sepMax = min((0.10 + 0.30 * (drive / 2.0)) / freq, 0.30);
+  float speedRatio = uBulletSpeed / BULLET_REF_SPEED; // chunks follow bullet speed
+  // Eject out of the void along the cone wall (object frame): chunks leave
+  // the cone interior instead of lingering in it. Capped with the hover so
+  // total travel stays lookup-valid.
+  vec3 coneAxisObj = gRotInv * vec3(1.0, 0.0, 0.0);
+  vec3 radObj = pivot - coneAxisObj * dot(pivot, coneAxisObj);
+  vec3 ejectDir = (coneAxisObj * 0.35 + radObj) / max(length(coneAxisObj * 0.35 + radObj), 0.05);
+  float core = 1.0 - smoothstep(-0.5, 0.05, dCp);
+  vec3 Traw = flyDir * sepMax + ejectDir * (0.45 * core);
+  float capT = min(0.5 / freq + 0.08, 0.5);
+  vec3 T = Traw * min(1.0, capT / max(length(Traw), 0.0001)) * (1.0 - exp(-tSince * 2.2 * speedRatio));
   // Own rotation: roll in the deflection plane, harder where pressure peaks.
   vec3 ax = cross(R, vec3(1.0, 0.0, 0.0)) + rnd * 0.9;
   float axl = length(ax);
   ax = (axl > 0.001) ? ax / axl : vec3(0.0, 1.0, 0.0);
-  float ang = 0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince;
+  float ang = min(0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince * speedRatio, 2.5);
   mat3 Ri = rotAxisAngle(ax, -ang);
-  vec3 q = pivot + Ri * (p - pivot - T);
-  float dChunk = sdSphere(q - SMOKE_CENTER, gRadius);
+  vec3 q = pivot + Ri * (obj - pivot - T);
+  // Vaporize inside the void: uniform shrink toward the pivot (similarity,
+  // shape preserved) driven by cone depth at the centroid.
+  float shrink = mix(0.25, 1.0, smoothstep(-0.5, 0.05, dCp));
+  vec3 qs = pivot + (q - pivot) / shrink;
+  float dChunk = solidBaseSDF(qs / gRadius) * gRadius * shrink;
   // Borders are tested in the chunk frame (they move with the pieces): a
   // second voronoi at q keeps the carve glued to the rotating chunks, so no
   // ghost shell lingers in the gaps and no static grid slices the pieces.
   vec3 dummy2;
-  vec4 vq = voronoi((q - SMOKE_CENTER) * freq, dummy2);
+  vec4 vq = voronoi(q * freq, dummy2);
   float borderW = (vq.y - vq.x) / freq;
   gBorderW = borderW;
   float dOpen = max(dChunk, gapHalfWidth(tSince, freq) - borderW);
@@ -602,11 +675,19 @@ vec3 groundNormal(vec3 p, vec3 ro) {
 // Distorted shock-cone SDF: base cone + animated compression ripple.
 // Integer phase cycles keep the ripple loop-safe.
 float coneField(vec3 p, float phase, float fade, float coneOX, float baseR) {
-  vec3 coneP = vec3(p.y, coneOX - p.x, p.z);
-  float d = sdRoundCone(coneP, 0.03 * fade, baseR * fade, uConeLength);
-  float apexW = clamp(1.0 - (coneOX - p.x) / uConeLength, 0.0, 1.0);
+  // baseR unused (kept for call-site stability); the cone below is infinite.
+  float behind = coneOX - p.x; // >0 trailing the bullet
+  float halfA = radians(uConeAngleDeg * 0.5);
+  float sa = sin(halfA);
+  float ca = cos(halfA);
+  float r = length(vec2(p.y, p.z));
+  float t = r * sa + behind * ca;
+  // Exact flank distance where the perpendicular foot lands on the surface,
+  // apex distance otherwise. Under-reports slightly off-flank: safe for
+  // marching (conservative steps), exact sign everywhere.
+  float d = (t <= 0.0) ? length(vec2(r, behind)) : r * ca - behind * sa;
   vec3 rq = p * uRippleFreq + vec3(phase * TAU * 4.0, phase * TAU * 6.0, 0.0);
-  return d + cnoise(rq) * uRippleAmp * (0.35 + 0.65 * apexW) * fade;
+  return d + cnoise(rq) * uRippleAmp * fade;
 }
 
 // Smoke density 0..~1: soft ball falloff shaped by fbm billows,
@@ -625,6 +706,26 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
     float sb = (dCone - 0.12) * 9.0;
     shell = exp(-sb * sb) * fade;
   }
+  // Wake trail frame (shared by the heat envelope below and the carve
+  // further down): flared at the cone angle so the trail continues the
+  // shock-cone surface with no radius step at the junction.
+  float trailTan = tan(radians(uConeAngleDeg * 0.5));
+  float trailR0 = 0.08;
+  float trailAx1 = coneOX + 0.29;
+  // Lingering wake heat: analytic age since the nose passed this x-station
+  // (straight constant-speed flight inverts exactly: no memory needed).
+  // No attenuation: visited trail holds full heat until the loop restarts;
+  // unvisited air (including everything behind spawn) stays cold.
+  // Feeds glow, churn, suppression and shimmer like live heat.
+  if (fade > 0.0) {
+    float noseX0 = SMOKE_CENTER.x - uShapeSize + 0.14;
+    float tPass = 0.5 + (p.x - noseX0) / 3.2;
+    float age = phase * LOOP_DURATION - tPass;
+    if (age > 0.0 && tPass > 0.4 && p.x < coneOX + 0.39) {
+      float rr = length(p.yz) / max(trailR0 + max(trailAx1 - p.x, 0.0) * trailTan, 0.08);
+      heat += exp(-rr * rr) * fade;
+    }
+  }
   float r = length(p - SMOKE_CENTER) / gRadius;
   if (r > 1.35) {
     return vec2(0.0, heat);
@@ -636,7 +737,30 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   float rl = length(radial);
   vec3 rdir = rl > 0.0001 ? radial / rl : vec3(0.0, 1.0, 0.0);
   // Fixed noise space: xyz is static, only the 4th coordinate (time) moves.
-  vec3 q = (p - SMOKE_CENTER + rdir * (pushBand * uPush * 0.6)) * uNoiseFrequency;
+  // Billow domain rotates with the shape; shock push stays world-fixed.
+  vec3 sp = gRotInv * (p - SMOKE_CENTER);
+  // Persistent wake distance (reused for carving below).
+  vec3 conePt = vec3(p.y, trailAx1 - p.x, p.z);
+  float trailBackLen = trailAx1 - (SMOKE_CENTER.x - uShapeSize - 0.2);
+  float trailR1 = (trailR0 + trailBackLen * trailTan) * fade;
+  float dTrail = (fade > 0.0)
+    ? sdRoundCone(conePt, trailR0 * fade, trailR1, max(trailBackLen, 0.01))
+    : 1e5;
+  // Residual bullet wind: circular drift (constant speed, never stalls;
+  // integer cycles keep the loop seamless), boosted inside the wake so the
+  // smoke animates until end of loop.
+  float wakeProx = exp(-pow(max(dTrail, 0.0) * 2.5, 2.0));
+  float wAng = loopPhase() * TAU;
+  vec3 windOff = vec3(cos(wAng), 0.35 * sin(wAng * 2.0), sin(wAng))
+    * (0.12 + wakeProx * (0.25 + uNoiseSpeed * 0.6));
+  // Stream smoke out of the cone void (empties it) + wake-confined circular
+  // swirl (one seamless turn per loop; zero outside the wake so the noise
+  // space stays fixed elsewhere).
+  float coneClear = (1.0 - smoothstep(-0.06, 0.15, dCone)) * fade;
+  float swS = sin(wAng);
+  float swC = cos(wAng);
+  vec2 spSwirl = mix(sp.yz, mat2(swC, swS, -swS, swC) * sp.yz, clamp(wakeProx, 0.0, 1.0));
+  vec3 q = (vec3(sp.x, spSwirl.x, spSwirl.y) + rdir * (pushBand * uPush * 0.6 + coneClear * 0.5) + windOff) * uNoiseFrequency;
   // 4th dimension = loop-safe noise-time: swings out and back every loop,
   // so the last frame wraps seamlessly while the pattern truly evolves.
   float wAmp = 0.15 + 0.85 * uNoiseSpeed;
@@ -668,7 +792,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   float compression = shell * 1.2 + stag * 0.8 - coreRare * 0.9;
   dens *= clamp(1.0 + uPush * compression, 0.0, 3.0);
   // Only the hot core itself is deleted.
-  dens *= smoothstep(-0.06, 0.06, dCone);
+  dens *= mix(1.0, smoothstep(-0.06, 0.06, dCone), fade);
   // Bow-shock channel ahead of the nose: cleared air the bullet flies in,
   // so it stays visible through the cloud (faded with the bullet).
   if (fade > 0.0) {
@@ -681,6 +805,10 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
     float dBow = sdCapsule(p, tail, noseTip, 0.26 * fade);
     dens *= mix(1.0, smoothstep(-0.05, 0.12, dBow), fade);
   }
+  // Persistent wake trail: everything the nose has passed stays deleted
+  // until the loop restarts (when the bullet teleports home the trail
+  // collapses with it). Gated by fade so nothing carves pre-pass.
+  dens *= mix(1.0, smoothstep(-0.06, 0.10, dTrail), fade);
   return vec2(max(dens, 0.0), heat);
 }
 
@@ -701,6 +829,40 @@ vec2 intersectSmokeBounds(vec3 ro, vec3 rd, float Rb) {
   }
   h = sqrt(h);
   return vec2(-b - h, -b + h);
+}
+
+// Analytic ray vs hot wake tube around the flight axis (slab x0..x1,
+// radius rad). The volume march can't span 50 units at 24 steps, so the
+// glow beyond the smoke ball is integrated in closed form instead —
+// no step count, no distance cap. Returns (tEnter, tExit), empty = (1,-1).
+vec2 wakeInterval(vec3 ro, vec3 rd, float x0, float x1, float rad) {
+  float t0 = 0.0;
+  float t1 = uMaxDistance;
+  if (abs(rd.x) > 0.0001) {
+    float tx0 = (x0 - ro.x) / rd.x;
+    float tx1 = (x1 - ro.x) / rd.x;
+    t0 = max(t0, min(tx0, tx1));
+    t1 = min(t1, max(tx0, tx1));
+  } else if (ro.x < x0 || ro.x > x1) {
+    return vec2(1.0, -1.0);
+  }
+  float a = rd.y * rd.y + rd.z * rd.z;
+  if (a < 0.00000001) {
+    if (dot(ro.yz, ro.yz) > rad * rad) {
+      return vec2(1.0, -1.0);
+    }
+  } else {
+    float b = ro.y * rd.y + ro.z * rd.z;
+    float c = dot(ro.yz, ro.yz) - rad * rad;
+    float h = b * b - a * c;
+    if (h < 0.0) {
+      return vec2(1.0, -1.0);
+    }
+    h = sqrt(h);
+    t0 = max(t0, (-b - h) / a);
+    t1 = min(t1, (-b + h) / a);
+  }
+  return vec2(t0, t1);
 }
 
 // Procedural star field: sparse magnitude-weighted cells, night only.
@@ -862,6 +1024,8 @@ void main() {
   float coneOX;
   float baseR;
   loopState(phase, fade, bx, coneOX, baseR);
+  gRot = shapeRotMat(uShapeYaw, uShapePitch, uShapeRoll);
+  gRotInv = transpose3(gRot);
   float gg = clamp(uAnisotropy, -0.85, 0.85);
 
   // --- Build camera basis ---
@@ -934,11 +1098,19 @@ void main() {
     prevD = s.x;
     prevT = t;
     // abs(): inside, |d| still bounds the forward distance (never step back).
-    float stepO = abs(s.x) * relaxO;
+    // Sphere chunks march near-relaxed (smooth rigid pieces converge fast);
+    // bullet/slab keep the conservative global factor.
+    float rlx = (uMode > 0.5 && s.y > 2.5) ? 0.9 : relaxO;
+    float stepO = abs(s.x) * rlx;
     if (abs(s.x) < 1.0) {
       // Tighter cap once shattered: chunk borders are discontinuous, and big
       // steps across them leak rays (flicker / phantom bridges between pieces).
-      float nearCap = (uMode > 0.5 && tSince > 0.001) ? 0.12 : 0.3;
+      // Resolution-aware: never step over the local cell size (crater rubble
+      // needs finer steps than far plates).
+      float nearCap = 0.3;
+      if (uMode > 0.5 && tSince > 0.001) {
+        nearCap = min(0.12, 0.6 / shardFreqAt(gRotInv * (p - SMOKE_CENTER)));
+      }
       stepO = min(stepO, nearCap); // never jump the thin slab near a surface
     }
     t += stepO;
@@ -962,6 +1134,16 @@ void main() {
     }
   }
 
+  // --- Wake glow beyond the smoke ball (analytic segment, uncapped) ---
+  // The volume march covers only the ball; the hot trail runs ~50 units.
+  float wlen = 0.0;
+  if (uMode < 0.5 && fade > 0.0) {
+    vec2 wt = wakeInterval(rayOrigin, rayDirection,
+      SMOKE_CENTER.x - uShapeSize - 0.2, coneOX + 0.29, 0.5);
+    float tBallExit = (bounds.x >= 0.0 || bounds.y > 0.0) ? max(bounds.y, 0.0) : 0.0;
+    wlen = max(min(wt.y, uMaxDistance) - max(wt.x, tBallExit), 0.0);
+    heatOD += wlen * 0.15;
+  }
   // --- Heat shimmer: hot-air column wobbles the background lookup ---
   float heatN = clamp(heatOD * 2.5, 0.0, 1.0);
   float shimmer = 0.10 * uHeatStrength * heatN;
@@ -988,6 +1170,8 @@ void main() {
     }
   } else {
     color = vol.rgb + vol.a * bg;
+    // Saturated wake emission (bounded: never blows up down a long tube).
+    color += vol.a * uHeatColor * (uHeatStrength * 0.35) * (1.0 - exp(-wlen * 0.8)) * fade;
   }
 
   // NOTE: no tb-vs-bounds gate on purpose. The volume already stops at
@@ -1068,14 +1252,14 @@ void main() {
       vec3 hvec = normalize(lightDir - rayDirection + vec3(1e-4));
       float ndh = max(dot(n, hvec), 0.0);
       float spec = pow(ndh, 120.0);
-      float clear = pow(ndh, 900.0);
+      float clear = pow(ndh, 250.0);
       float fresS = pow(1.0 - clamp(dot(-rayDirection, n), 0.0, 1.0), 5.0);
       vec3 scol = albedo * (0.12 + diffuseFactor) * uLightColor * uLightIntensity
         + vec3(1.0) * spec * 1.1
         + vec3(1.0) * clear * 2.0
         + albedo * fresS * 0.6;
       // Dark crack lines along the moved partition borders.
-      float crack = (1.0 - smoothstep(0.0, max(gapHalfWidth(tSince, shardFreqAt(hitPos)) * 1.5, 0.004), hitBorder))
+      float crack = (1.0 - smoothstep(0.0, max(gapHalfWidth(tSince, shardFreqAt(gRotInv * (hitPos - SMOKE_CENTER))) * 1.5, 0.004), hitBorder))
         * clamp(tSince * 2.0, 0.0, 1.0);
       scol *= 1.0 - crack * 0.8;
       color = vol.rgb + vol.a * scol;
@@ -1084,4 +1268,4 @@ void main() {
 
   gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }
-`,vo=(e,t)=>{let n=e.__vccOpts||e;for(let[e,r]of t)n[e]=r;return n},yo={class:`raymarch-container`},bo={class:`mode-toggle`},xo={class:`hud`},So={class:`loop-track`},Co={class:`hud-row`},wo={class:`hud-row`},To={class:`hud-row`},Eo={class:`hud-row`},Do={class:`hud-row`},Oo={key:0,class:`hud-error`},ko={class:`controls`},Ao={class:`ctl`},jo={class:`ctl`},Mo={class:`ctl`},No={class:`ctl`},Po={class:`ctl`},Fo={class:`ctl`},Io={class:`ctl`},Lo={class:`ctl`},Ro={class:`ctl`},zo={class:`ctl`},Bo={class:`ctl`},Vo={class:`ctl`},Ho={class:`ctl`},Uo={class:`ctl`},Wo={class:`ctl ctl-check`},Go={class:`ctl`},Ko={class:`ctl`},qo={class:`ctl`},Jo={class:`ctl`},Yo={class:`ctl`},Xo={key:0,class:`controls-note`},Zo={key:1,class:`ctl`},Qo={key:2,class:`ctl`},$o={class:`ctl`},es={class:`ctl`},ts={class:`ctl`},ns={class:`ctl`},rs={class:`ctl`},is={class:`ctl`},as={class:`ctl`},os={class:`ctl`},ss={class:`ctl`},cs={class:`ctl`},ls=16,us=1.8,ds=1.3,fs=4,ps=1.2,ms=2.8,hs=12,gs=.0052,_s=vo({__name:`RaymarchCanvas`,setup(e){let t=Mt({maxSteps:64,epsilon:.004,maxDistance:200,camYaw:-1.157,camPitch:-.041,camDist:3.16,cameraUp:[0,1,0],cameraFov:60,sunAzimuth:320,sunElevation:46,sunColor:`#fff3e0`,skyColor:`#4a7ec2`,flare:1.2,smokeRadius:1.7,smokeDensity:2,noiseAmplitude:.8,noiseFrequency:4,noiseOctaves:4,noiseLacunarity:2,noiseGain:.8,noiseSpeed:0,coneAngle:35,coneLength:3.5,rippleAmp:.05,rippleFreq:9,push:1.5,mode:`cloud`,shardFreq:2.5,shardMin:.1,groundAmp:.08,groundPeriod:1.2,groundOct:4,groundLac:2,showGround:!1,debugMode:`off`,smokeColor:`#8ea2c8`,heatColor:`#ff7a26`,anisotropy:.3,heatStrength:0,scatter:1,maxDevicePixelRatio:2}),n=la({get:()=>1/t.noiseFrequency,set:e=>{e>0&&(t.noiseFrequency=1/e)}}),r=Vt(null),i=Vt(null),a=Vt(null),o=Vt(null),s=Vt(null),c=Vt(``),l=null,u=null,d={},f=0,p=0,m=0,h=-1,g=0,_=0,v=0,y=new Set,b=0,x=0,S=5;function C(e,t,n,r){let i=e.createShader(t);if(e.shaderSource(i,n),e.compileShader(i),!e.getShaderParameter(i,e.COMPILE_STATUS)){let t=e.getShaderInfoLog(i);throw Error(`${r} compilation failed:\n${t}`)}return i}function w(e,t,n){let r=C(e,e.VERTEX_SHADER,t,`Vertex shader`),i=C(e,e.FRAGMENT_SHADER,n,`Fragment shader`),a=e.createProgram();if(e.attachShader(a,r),e.attachShader(a,i),e.linkProgram(a),!e.getProgramParameter(a,e.LINK_STATUS)){let t=e.getProgramInfoLog(a);throw Error(`Program linking failed:\n${t}`)}return a}function ee(e){let t=Math.hypot(e[0],e[1],e[2])||1;return[e[0]/t,e[1]/t,e[2]/t]}function T(e){let t=/^#?([0-9a-f]{6})$/i.exec(String(e).trim());if(!t)return[1,1,1];let n=parseInt(t[1],16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}function te(e,t,n){let r=Math.min(1,Math.max(0,(n-e)/(t-e)));return r*r*(3-2*r)}function E(){let e=t.sunAzimuth*Math.PI/180,n=t.sunElevation*Math.PI/180,r=[Math.cos(n)*Math.sin(e),Math.sin(n),Math.cos(n)*Math.cos(e)],i=te(-.1,.25,r[1]),a=T(t.sunColor),o=.12+.88*i;return{dir:ee(r),dayF:i,lightColor:[a[0]*o,a[1]*o,a[2]*o],lightIntensity:.04+1.35*i}}function ne(){let e=r.value,n=e.clientWidth||window.innerWidth,i=e.clientHeight||window.innerHeight,a=Math.min(window.devicePixelRatio||1,t.maxDevicePixelRatio),o=Math.floor(n*a),s=Math.floor(i*a),c=2073600,u=o*s;if(u>c){let e=Math.sqrt(c/u);o=Math.max(1,Math.floor(o*e)),s=Math.max(1,Math.floor(s*e))}(e.width!==o||e.height!==s)&&(e.width=o,e.height=s),l.viewport(0,0,e.width,e.height)}function D(){for(let e of`uCameraPosition.uCameraForward.uCameraUp.uCameraFov.uAspectRatio.uSmokeRadius.uSmokeDensity.uSmokeColor.uScatter.uAnisotropy.uHeatColor.uHeatStrength.uNoiseAmplitude.uNoiseFrequency.uNoiseOctaves.uLacunarity.uNoiseGain.uNoiseSpeed.uConeAngleDeg.uConeLength.uPush.uRippleAmp.uRippleFreq.uGroundAmp.uGroundPeriod.uGroundOct.uGroundLac.uMode.uShardFreq.uShardMin.uShowGround.uDebugMode.uSunColor.uSkyColor.uFlare.uEpsilon.uMaxDistance.uLightDirection.uLightColor.uLightIntensity.uTime.uResolution`.split(`.`))d[e]=l.getUniformLocation(u,e)}function re(){let e=d;e.uCameraUp&&l.uniform3fv(e.uCameraUp,t.cameraUp),e.uCameraFov&&l.uniform1f(e.uCameraFov,t.cameraFov),e.uEpsilon&&l.uniform1f(e.uEpsilon,t.epsilon),e.uMaxDistance&&l.uniform1f(e.uMaxDistance,t.maxDistance)}function ie(e){let n=r.value,i=d;i.uTime&&l.uniform1f(i.uTime,e),i.uAspectRatio&&l.uniform1f(i.uAspectRatio,n.width/n.height),i.uResolution&&l.uniform2f(i.uResolution,n.width,n.height),i.uSmokeRadius&&l.uniform1f(i.uSmokeRadius,t.smokeRadius),i.uSmokeDensity&&l.uniform1f(i.uSmokeDensity,t.smokeDensity),i.uNoiseAmplitude&&l.uniform1f(i.uNoiseAmplitude,t.noiseAmplitude),i.uNoiseFrequency&&l.uniform1f(i.uNoiseFrequency,t.noiseFrequency),i.uNoiseOctaves&&l.uniform1i(i.uNoiseOctaves,Math.max(1,Math.min(8,Math.round(t.noiseOctaves)))),i.uLacunarity&&l.uniform1f(i.uLacunarity,t.noiseLacunarity),i.uNoiseGain&&l.uniform1f(i.uNoiseGain,t.noiseGain),i.uNoiseSpeed&&l.uniform1f(i.uNoiseSpeed,t.noiseSpeed),i.uConeAngleDeg&&l.uniform1f(i.uConeAngleDeg,t.coneAngle),i.uConeLength&&l.uniform1f(i.uConeLength,t.coneLength),i.uPush&&l.uniform1f(i.uPush,t.push),i.uGroundAmp&&l.uniform1f(i.uGroundAmp,t.groundAmp),i.uGroundPeriod&&l.uniform1f(i.uGroundPeriod,t.groundPeriod),i.uGroundOct&&l.uniform1i(i.uGroundOct,Math.max(1,Math.min(8,Math.round(t.groundOct)))),i.uGroundLac&&l.uniform1f(i.uGroundLac,t.groundLac),i.uMode&&l.uniform1f(i.uMode,+(t.mode===`sphere`)),i.uShardFreq&&l.uniform1f(i.uShardFreq,t.shardFreq),i.uShardMin&&l.uniform1f(i.uShardMin,t.shardMin),i.uShowGround&&l.uniform1f(i.uShowGround,+!!t.showGround),i.uDebugMode&&l.uniform1f(i.uDebugMode,{off:0,compression:1,heat:2,density:3,cone:4}[t.debugMode]??0),i.uRippleAmp&&l.uniform1f(i.uRippleAmp,t.rippleAmp),i.uRippleFreq&&l.uniform1f(i.uRippleFreq,t.rippleFreq),i.uSmokeColor&&l.uniform3fv(i.uSmokeColor,T(t.smokeColor)),i.uScatter&&l.uniform1f(i.uScatter,t.scatter),i.uAnisotropy&&l.uniform1f(i.uAnisotropy,t.anisotropy),i.uHeatColor&&l.uniform3fv(i.uHeatColor,T(t.heatColor)),i.uHeatStrength&&l.uniform1f(i.uHeatStrength,t.heatStrength);let a=E();i.uLightDirection&&l.uniform3fv(i.uLightDirection,a.dir),i.uLightColor&&l.uniform3fv(i.uLightColor,a.lightColor),i.uLightIntensity&&l.uniform1f(i.uLightIntensity,a.lightIntensity),i.uSunColor&&l.uniform3fv(i.uSunColor,T(t.sunColor)),i.uSkyColor&&l.uniform3fv(i.uSkyColor,T(t.skyColor)),i.uFlare&&l.uniform1f(i.uFlare,t.flare)}function O(e){if(e.ctrlKey||e.metaKey||e.altKey)return;let t=e.target&&e.target.tagName||``;if(t===`INPUT`||t===`TEXTAREA`||t===`SELECT`)return;let n=e.key.toLowerCase();(n===`w`||n===`a`||n===`s`||n===`d`||n===`q`||n===`e`||n===`shift`||n===`arrowup`||n===`arrowdown`||n===`arrowleft`||n===`arrowright`)&&(y.add(n),e.preventDefault())}function ae(e){y.delete(e.key.toLowerCase())}function k(e){let n=y.has(`shift`)?2.5:1;(y.has(`a`)||y.has(`arrowleft`))&&(t.camYaw-=us*n*e),(y.has(`d`)||y.has(`arrowright`))&&(t.camYaw+=us*n*e),(y.has(`w`)||y.has(`arrowup`))&&(t.camPitch+=ds*n*e),(y.has(`s`)||y.has(`arrowdown`))&&(t.camPitch-=ds*n*e),y.has(`q`)&&(t.camDist-=fs*n*e),y.has(`e`)&&(t.camDist+=fs*n*e),t.camPitch=Math.max(-1.2,Math.min(ps,t.camPitch)),t.camDist=Math.max(ms,Math.min(hs,t.camDist));let r=1-Math.exp(-e*10);b+=(t.camYaw-b)*r,x+=(t.camPitch-x)*r,S+=(t.camDist-S)*r;let i=Math.cos(x),a=[S*i*Math.sin(b),S*Math.sin(x),S*i*Math.cos(b)],s=ee([-a[0],-a[1],-a[2]]),c=d;c.uCameraPosition&&l.uniform3fv(c.uCameraPosition,a),c.uCameraForward&&l.uniform3fv(c.uCameraForward,s),o.value&&(o.value.textContent=`[${a.map(e=>e.toFixed(2)).join(`, `)}]`)}function oe(e){ne();let t=(e-p)/1e3,n=m?e-m:16.7,r=Math.min(.1,n/1e3||.016);if(m=e,h=h<0?n:h+(n-h)*.08,g+=1,_=Math.max(_,n),v+=n,v>=500&&s.value){let e=g*1e3/v;s.value.textContent=`${h.toFixed(1)}ms · ${e.toFixed(0)}fps · worst ${_.toFixed(1)}ms`,g=0,_=0,v=0}k(r),ie(t);let o=t%ls/ls;i.value&&(i.value.style.transform=`scaleX(${o})`),a.value&&(a.value.textContent=`${(o*ls).toFixed(1)}s / ${ls.toFixed(0)}s`),l.drawArrays(l.TRIANGLES,0,3),f=requestAnimationFrame(oe)}function se(){l&&ne()}function ce(){y.clear()}let A=new Map,le=0;function ue(e){if(e.pointerType!==`mouse`||e.button===0){try{r.value.setPointerCapture(e.pointerId)}catch{}if(A.set(e.pointerId,{x:e.clientX,y:e.clientY}),A.size===2){let[e,t]=[...A.values()];le=Math.hypot(e.x-t.x,e.y-t.y)}}}function de(e){let n=A.get(e.pointerId);if(!n)return;let r={x:e.clientX,y:e.clientY};if(A.set(e.pointerId,r),A.size===1)t.camYaw+=(r.x-n.x)*gs,t.camPitch-=(r.y-n.y)*gs;else if(A.size===2){let[e,n]=[...A.values()],r=Math.hypot(e.x-n.x,e.y-n.y);le>0&&r>0&&(t.camDist=Math.max(ms,Math.min(hs,t.camDist*(le/r)))),le=r}}function fe(e){A.delete(e.pointerId),le=0}function pe(e){e.preventDefault();let n=e.deltaMode===1?e.deltaY*16:e.deltaY;t.camDist=Math.max(ms,Math.min(hs,t.camDist*Math.exp(n*.001)))}return Zn(()=>{let e=r.value;try{let n={antialias:!1,depth:!1,stencil:!1,alpha:!1,preserveDrawingBuffer:!1,desynchronized:!0,powerPreference:`high-performance`};if(l=e.getContext(`webgl2`,n)||e.getContext(`webgl`,n)||e.getContext(`experimental-webgl`),!l)throw Error(`WebGL is not supported by this browser.`);u=w(l,go,_o),l.useProgram(u);let r=new Float32Array([-1,-1,3,-1,-1,3]),i=l.createBuffer();l.bindBuffer(l.ARRAY_BUFFER,i),l.bufferData(l.ARRAY_BUFFER,r,l.STATIC_DRAW);let a=l.getAttribLocation(u,`aPosition`);if(a<0)throw Error(`Attribute 'aPosition' not found in vertex shader.`);l.enableVertexAttribArray(a),l.vertexAttribPointer(a,2,l.FLOAT,!1,0,0),D(),re(),window.addEventListener(`resize`,se),window.addEventListener(`keydown`,O),window.addEventListener(`keyup`,ae),window.addEventListener(`blur`,ce),e.addEventListener(`pointerdown`,ue),e.addEventListener(`pointermove`,de),e.addEventListener(`pointerup`,fe),e.addEventListener(`pointercancel`,fe),e.addEventListener(`wheel`,pe,{passive:!1}),b=t.camYaw,x=t.camPitch,S=t.camDist,ne(),p=performance.now(),m=0,f=requestAnimationFrame(oe)}catch(e){c.value=e instanceof Error?e.message:String(e),console.error(e)}}),tr(()=>{cancelAnimationFrame(f),window.removeEventListener(`resize`,se),window.removeEventListener(`keydown`,O),window.removeEventListener(`keyup`,ae),window.removeEventListener(`blur`,ce),r.value?.removeEventListener(`pointerdown`,ue),r.value?.removeEventListener(`pointermove`,de),r.value?.removeEventListener(`pointerup`,fe),r.value?.removeEventListener(`pointercancel`,fe),r.value?.removeEventListener(`wheel`,pe),y.clear(),A.clear(),l&&u&&(l.deleteProgram(u),u=null)}),(e,l)=>(Ci(),Oi(`div`,yo,[X(`div`,bo,[X(`button`,{class:j({active:t.mode===`cloud`}),onClick:l[0]||=e=>t.mode=`cloud`},`Cloud`,2),X(`button`,{class:j({active:t.mode===`sphere`}),onClick:l[1]||=e=>t.mode=`sphere`},`Sphere`,2)]),X(`canvas`,{ref_key:`canvasRef`,ref:r,class:`raymarch-canvas`},null,512),X(`div`,xo,[l[39]||=X(`div`,{class:`hud-title`},`Smoke + Shockwave`,-1),X(`div`,So,[X(`div`,{ref_key:`loopBarRef`,ref:i,class:`loop-fill`},null,512)]),X(`div`,Co,[l[34]||=X(`span`,null,`March steps`,-1),X(`code`,null,N(t.maxSteps),1)]),X(`div`,wo,[l[35]||=X(`span`,null,`Frame`,-1),X(`code`,{ref_key:`frameMsEl`,ref:s},`-- ms · -- fps`,512)]),X(`div`,To,[l[36]||=X(`span`,null,`Camera pos`,-1),X(`code`,{ref_key:`camPosEl`,ref:o},`[0.00, 0.00, 5.00]`,512)]),l[40]||=X(`div`,{class:`hud-row hud-hint`},[X(`span`,null,`Drag / WASD orbit · wheel zoom`)],-1),X(`div`,Eo,[l[37]||=X(`span`,null,`Sun`,-1),X(`code`,null,N(t.sunAzimuth.toFixed(0))+`° / `+N(t.sunElevation.toFixed(0))+`°`,1)]),X(`div`,Do,[l[38]||=X(`span`,null,`Loop`,-1),X(`code`,{ref_key:`phaseEl`,ref:a},`0.0s / 16s`,512)]),c.value?(Ci(),Oi(`div`,Oo,N(c.value),1)):zi(``,!0)]),X(`div`,ko,[l[74]||=X(`div`,{class:`controls-title`},`Smoke`,-1),X(`label`,Ao,[X(`span`,null,[l[41]||=Z(`Density `,-1),X(`code`,null,N(t.smokeDensity.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`2`,step:`0.05`,"onUpdate:modelValue":l[2]||=e=>t.smokeDensity=e},null,512),[[$,t.smokeDensity,void 0,{number:!0}]])]),X(`label`,jo,[X(`span`,null,[l[42]||=Z(`Radius `,-1),X(`code`,null,N(t.smokeRadius.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1`,max:`2.5`,step:`0.05`,"onUpdate:modelValue":l[3]||=e=>t.smokeRadius=e},null,512),[[$,t.smokeRadius,void 0,{number:!0}]])]),X(`label`,Mo,[X(`span`,null,[l[43]||=Z(`Billow `,-1),X(`code`,null,N(t.noiseAmplitude.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`0.8`,step:`0.01`,"onUpdate:modelValue":l[4]||=e=>t.noiseAmplitude=e},null,512),[[$,t.noiseAmplitude,void 0,{number:!0}]])]),X(`label`,No,[X(`span`,null,[l[44]||=Z(`Frequency `,-1),X(`code`,null,N(t.noiseFrequency.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.5`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[5]||=e=>t.noiseFrequency=e},null,512),[[$,t.noiseFrequency,void 0,{number:!0}]])]),X(`label`,Po,[X(`span`,null,[l[45]||=Z(`Period `,-1),X(`code`,null,N(n.value.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.25`,max:`2`,step:`0.05`,"onUpdate:modelValue":l[6]||=e=>n.value=e},null,512),[[$,n.value,void 0,{number:!0}]])]),X(`label`,Fo,[X(`span`,null,[l[46]||=Z(`Octaves `,-1),X(`code`,null,N(t.noiseOctaves),1)]),K(X(`input`,{type:`range`,min:`1`,max:`8`,step:`1`,"onUpdate:modelValue":l[7]||=e=>t.noiseOctaves=e},null,512),[[$,t.noiseOctaves,void 0,{number:!0}]])]),X(`label`,Io,[X(`span`,null,[l[47]||=Z(`Lacunarity `,-1),X(`code`,null,N(t.noiseLacunarity.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1.5`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[8]||=e=>t.noiseLacunarity=e},null,512),[[$,t.noiseLacunarity,void 0,{number:!0}]])]),X(`label`,Lo,[X(`span`,null,[l[48]||=Z(`Gain `,-1),X(`code`,null,N(t.noiseGain.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.2`,max:`0.8`,step:`0.01`,"onUpdate:modelValue":l[9]||=e=>t.noiseGain=e},null,512),[[$,t.noiseGain,void 0,{number:!0}]])]),X(`label`,Ro,[X(`span`,null,[l[49]||=Z(`Flow speed `,-1),X(`code`,null,N(t.noiseSpeed.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`1.5`,step:`0.05`,"onUpdate:modelValue":l[10]||=e=>t.noiseSpeed=e},null,512),[[$,t.noiseSpeed,void 0,{number:!0}]])]),l[75]||=X(`div`,{class:`controls-title`},`Shockwave`,-1),X(`label`,zo,[X(`span`,null,[l[50]||=Z(`Cone angle `,-1),X(`code`,null,N(t.coneAngle.toFixed(1))+`°`,1)]),K(X(`input`,{type:`range`,min:`10`,max:`35`,step:`0.5`,"onUpdate:modelValue":l[11]||=e=>t.coneAngle=e},null,512),[[$,t.coneAngle,void 0,{number:!0}]])]),X(`label`,Bo,[X(`span`,null,[l[51]||=Z(`Cone length `,-1),X(`code`,null,N(t.coneLength.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1.5`,max:`3.5`,step:`0.1`,"onUpdate:modelValue":l[12]||=e=>t.coneLength=e},null,512),[[$,t.coneLength,void 0,{number:!0}]])]),X(`label`,Vo,[X(`span`,null,[l[52]||=Z(`Ripple amp `,-1),X(`code`,null,N(t.rippleAmp.toFixed(3)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`0.15`,step:`0.005`,"onUpdate:modelValue":l[13]||=e=>t.rippleAmp=e},null,512),[[$,t.rippleAmp,void 0,{number:!0}]])]),X(`label`,Ho,[X(`span`,null,[l[53]||=Z(`Ripple freq `,-1),X(`code`,null,N(t.rippleFreq.toFixed(1)),1)]),K(X(`input`,{type:`range`,min:`2`,max:`20`,step:`0.5`,"onUpdate:modelValue":l[14]||=e=>t.rippleFreq=e},null,512),[[$,t.rippleFreq,void 0,{number:!0}]])]),X(`label`,Uo,[X(`span`,null,[l[54]||=Z(`Shock push `,-1),X(`code`,null,N(t.push.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`1.5`,step:`0.05`,"onUpdate:modelValue":l[15]||=e=>t.push=e},null,512),[[$,t.push,void 0,{number:!0}]])]),l[76]||=X(`div`,{class:`controls-title`},`Ground`,-1),X(`label`,Wo,[X(`span`,null,[l[55]||=Z(`Visible `,-1),K(X(`input`,{type:`checkbox`,"onUpdate:modelValue":l[16]||=e=>t.showGround=e},null,512),[[no,t.showGround]])])]),X(`label`,Go,[X(`span`,null,[l[56]||=Z(`Perturb amp `,-1),X(`code`,null,N(t.groundAmp.toFixed(3)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`0.3`,step:`0.005`,"onUpdate:modelValue":l[17]||=e=>t.groundAmp=e},null,512),[[$,t.groundAmp,void 0,{number:!0}]])]),X(`label`,Ko,[X(`span`,null,[l[57]||=Z(`Period `,-1),X(`code`,null,N(t.groundPeriod.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.25`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[18]||=e=>t.groundPeriod=e},null,512),[[$,t.groundPeriod,void 0,{number:!0}]])]),X(`label`,qo,[X(`span`,null,[l[58]||=Z(`Octaves `,-1),X(`code`,null,N(t.groundOct),1)]),K(X(`input`,{type:`range`,min:`1`,max:`8`,step:`1`,"onUpdate:modelValue":l[19]||=e=>t.groundOct=e},null,512),[[$,t.groundOct,void 0,{number:!0}]])]),X(`label`,Jo,[X(`span`,null,[l[59]||=Z(`Lacunarity `,-1),X(`code`,null,N(t.groundLac.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1.5`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[20]||=e=>t.groundLac=e},null,512),[[$,t.groundLac,void 0,{number:!0}]])]),l[77]||=X(`div`,{class:`controls-title`},`Debug`,-1),X(`label`,Yo,[l[61]||=X(`span`,null,`Field view`,-1),K(X(`select`,{"onUpdate:modelValue":l[21]||=e=>t.debugMode=e,class:`debug-select`},[...l[60]||=[Ri(`<option value="off" data-v-acfd1163>Off</option><option value="compression" data-v-acfd1163>Air compression</option><option value="heat" data-v-acfd1163>Heat</option><option value="density" data-v-acfd1163>Density</option><option value="cone" data-v-acfd1163>Cone SDF</option>`,5)]],512),[[io,t.debugMode]])]),l[78]||=X(`div`,{class:`controls-title`},`Sphere`,-1),t.mode===`sphere`?zi(``,!0):(Ci(),Oi(`div`,Xo,`Switch to Sphere mode above.`)),t.mode===`sphere`?(Ci(),Oi(`label`,Zo,[X(`span`,null,[l[62]||=Z(`Shard scale `,-1),X(`code`,null,N(t.shardFreq.toFixed(1)),1)]),K(X(`input`,{type:`range`,min:`1`,max:`6`,step:`0.1`,"onUpdate:modelValue":l[22]||=e=>t.shardFreq=e},null,512),[[$,t.shardFreq,void 0,{number:!0}]])])):zi(``,!0),t.mode===`sphere`?(Ci(),Oi(`label`,Qo,[X(`span`,null,[l[63]||=Z(`Min shard `,-1),X(`code`,null,N(t.shardMin.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.02`,max:`0.5`,step:`0.01`,"onUpdate:modelValue":l[23]||=e=>t.shardMin=e},null,512),[[$,t.shardMin,void 0,{number:!0}]])])):zi(``,!0),l[79]||=X(`div`,{class:`controls-title`},`Sky & sun`,-1),X(`label`,$o,[X(`span`,null,[l[64]||=Z(`Azimuth `,-1),X(`code`,null,N(t.sunAzimuth.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`0`,max:`360`,step:`1`,"onUpdate:modelValue":l[24]||=e=>t.sunAzimuth=e},null,512),[[$,t.sunAzimuth,void 0,{number:!0}]])]),X(`label`,es,[X(`span`,null,[l[65]||=Z(`Elevation `,-1),X(`code`,null,N(t.sunElevation.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`-15`,max:`90`,step:`1`,"onUpdate:modelValue":l[25]||=e=>t.sunElevation=e},null,512),[[$,t.sunElevation,void 0,{number:!0}]])]),X(`label`,ts,[l[66]||=X(`span`,null,`Sun colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[26]||=e=>t.sunColor=e},null,512),[[$,t.sunColor]])]),X(`label`,ns,[l[67]||=X(`span`,null,`Sky colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[27]||=e=>t.skyColor=e},null,512),[[$,t.skyColor]])]),X(`label`,rs,[X(`span`,null,[l[68]||=Z(`Flare `,-1),X(`code`,null,N(t.flare.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`3`,step:`0.05`,"onUpdate:modelValue":l[28]||=e=>t.flare=e},null,512),[[$,t.flare,void 0,{number:!0}]])]),l[80]||=X(`div`,{class:`controls-title`},`Light & heat`,-1),X(`label`,is,[l[69]||=X(`span`,null,`Smoke colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[29]||=e=>t.smokeColor=e},null,512),[[$,t.smokeColor]])]),X(`label`,as,[l[70]||=X(`span`,null,`Heat colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[30]||=e=>t.heatColor=e},null,512),[[$,t.heatColor]])]),X(`label`,os,[X(`span`,null,[l[71]||=Z(`Anisotropy `,-1),X(`code`,null,N(t.anisotropy.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`-0.85`,max:`0.85`,step:`0.05`,"onUpdate:modelValue":l[31]||=e=>t.anisotropy=e},null,512),[[$,t.anisotropy,void 0,{number:!0}]])]),X(`label`,ss,[X(`span`,null,[l[72]||=Z(`Heat `,-1),X(`code`,null,N(t.heatStrength.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`3`,step:`0.05`,"onUpdate:modelValue":l[32]||=e=>t.heatStrength=e},null,512),[[$,t.heatStrength,void 0,{number:!0}]])]),X(`label`,cs,[X(`span`,null,[l[73]||=Z(`Scatter `,-1),X(`code`,null,N(t.scatter.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`2.5`,step:`0.05`,"onUpdate:modelValue":l[33]||=e=>t.scatter=e},null,512),[[$,t.scatter,void 0,{number:!0}]])])])]))}},[[`__scopeId`,`data-v-acfd1163`]]);po({__name:`App`,setup(e){return(e,t)=>(Ci(),ki(_s))}}).mount(`#app`);
+`,vo=(e,t)=>{let n=e.__vccOpts||e;for(let[e,r]of t)n[e]=r;return n},yo={class:`raymarch-container`},bo={class:`hud`},xo={class:`loop-track`},So={class:`hud-row`},Co={class:`hud-row`},wo={class:`hud-row`},To={class:`hud-row`},Eo={class:`hud-row`},Do={key:0,class:`hud-error`},Oo={class:`controls`},ko={class:`ctl`},Ao={class:`ctl`},jo={class:`ctl`},Mo={class:`ctl`},No={class:`ctl`},Po={class:`ctl`},Fo={key:0},Io={class:`ctl`},Lo={class:`ctl`},Ro={class:`ctl`},zo={class:`ctl`},Bo={class:`ctl`},Vo={class:`ctl`},Ho={class:`ctl`},Uo={class:`ctl`},Wo={class:`ctl`},Go={class:`ctl`},Ko={class:`ctl`},qo={class:`ctl`},Jo={class:`ctl`},Yo={class:`ctl ctl-check`},Xo={class:`ctl`},Zo={class:`ctl`},Qo={class:`ctl`},$o={class:`ctl`},es={class:`ctl`},ts={key:1,class:`controls-note`},ns={key:2,class:`ctl`},rs={class:`ctl`},is={class:`ctl`},as={class:`ctl`},os={class:`ctl`},ss={class:`ctl`},cs={class:`ctl`},ls={class:`ctl`},us={class:`ctl`},ds={class:`ctl`},fs={class:`ctl`},ps=16,ms=1.8,hs=1.3,gs=4,_s=1.2,vs=2.8,ys=12,bs=.0052,xs=vo({__name:`RaymarchCanvas`,setup(e){let t=Mt({maxSteps:64,epsilon:.004,maxDistance:200,camYaw:-1.157,camPitch:-.041,camDist:3.16,cameraUp:[0,1,0],cameraFov:60,sunAzimuth:320,sunElevation:46,sunColor:`#fff3e0`,skyColor:`#4a7ec2`,flare:1.2,size:1.7,shapeYaw:0,shapePitch:0,shapeRoll:0,bulletSpeed:3.2,smokeDensity:2,noiseAmplitude:.8,noiseFrequency:4,noiseOctaves:4,noiseLacunarity:2,noiseGain:.8,noiseSpeed:0,coneAngle:35,coneLength:3.5,rippleAmp:.05,rippleFreq:9,push:1.5,mode:`cloud`,shardMin:.1,groundAmp:.08,groundPeriod:1.2,groundOct:4,groundLac:2,showGround:!1,debugMode:`off`,smokeColor:`#8ea2c8`,heatColor:`#ff7a26`,anisotropy:.3,heatStrength:0,scatter:1,maxDevicePixelRatio:2}),n=la({get:()=>1/t.noiseFrequency,set:e=>{e>0&&(t.noiseFrequency=1/e)}}),r=Vt(null),i=Vt(null),a=Vt(null),o=Vt(null),s=Vt(null),c=Vt(``),l=null,u=null,d={},f=0,p=0,m=0,h=-1,g=0,_=0,v=0,y=new Set,b=0,x=0,S=5;function C(e,t,n,r){let i=e.createShader(t);if(e.shaderSource(i,n),e.compileShader(i),!e.getShaderParameter(i,e.COMPILE_STATUS)){let t=e.getShaderInfoLog(i);throw Error(`${r} compilation failed:\n${t}`)}return i}function w(e,t,n){let r=C(e,e.VERTEX_SHADER,t,`Vertex shader`),i=C(e,e.FRAGMENT_SHADER,n,`Fragment shader`),a=e.createProgram();if(e.attachShader(a,r),e.attachShader(a,i),e.linkProgram(a),!e.getProgramParameter(a,e.LINK_STATUS)){let t=e.getProgramInfoLog(a);throw Error(`Program linking failed:\n${t}`)}return a}function ee(e){let t=Math.hypot(e[0],e[1],e[2])||1;return[e[0]/t,e[1]/t,e[2]/t]}function T(e){let t=/^#?([0-9a-f]{6})$/i.exec(String(e).trim());if(!t)return[1,1,1];let n=parseInt(t[1],16);return[(n>>16&255)/255,(n>>8&255)/255,(n&255)/255]}function te(e,t,n){let r=Math.min(1,Math.max(0,(n-e)/(t-e)));return r*r*(3-2*r)}function E(){let e=t.sunAzimuth*Math.PI/180,n=t.sunElevation*Math.PI/180,r=[Math.cos(n)*Math.sin(e),Math.sin(n),Math.cos(n)*Math.cos(e)],i=te(-.1,.25,r[1]),a=T(t.sunColor),o=.12+.88*i;return{dir:ee(r),dayF:i,lightColor:[a[0]*o,a[1]*o,a[2]*o],lightIntensity:.04+1.35*i}}function ne(){let e=r.value,n=e.clientWidth||window.innerWidth,i=e.clientHeight||window.innerHeight,a=Math.min(window.devicePixelRatio||1,t.maxDevicePixelRatio),o=Math.floor(n*a),s=Math.floor(i*a),c=2073600,u=o*s;if(u>c){let e=Math.sqrt(c/u);o=Math.max(1,Math.floor(o*e)),s=Math.max(1,Math.floor(s*e))}(e.width!==o||e.height!==s)&&(e.width=o,e.height=s),l.viewport(0,0,e.width,e.height)}function D(){for(let e of`uCameraPosition.uCameraForward.uCameraUp.uCameraFov.uAspectRatio.uShapeSize.uShapeYaw.uShapePitch.uShapeRoll.uBulletSpeed.uSmokeDensity.uSmokeColor.uScatter.uAnisotropy.uHeatColor.uHeatStrength.uNoiseAmplitude.uNoiseFrequency.uNoiseOctaves.uLacunarity.uNoiseGain.uNoiseSpeed.uConeAngleDeg.uConeLength.uPush.uRippleAmp.uRippleFreq.uGroundAmp.uGroundPeriod.uGroundOct.uGroundLac.uMode.uShardMin.uShowGround.uDebugMode.uSunColor.uSkyColor.uFlare.uEpsilon.uMaxDistance.uLightDirection.uLightColor.uLightIntensity.uTime.uResolution`.split(`.`))d[e]=l.getUniformLocation(u,e)}function re(){let e=d;e.uCameraUp&&l.uniform3fv(e.uCameraUp,t.cameraUp),e.uCameraFov&&l.uniform1f(e.uCameraFov,t.cameraFov),e.uEpsilon&&l.uniform1f(e.uEpsilon,t.epsilon),e.uMaxDistance&&l.uniform1f(e.uMaxDistance,t.maxDistance)}function ie(e){let n=r.value,i=d;i.uTime&&l.uniform1f(i.uTime,e),i.uAspectRatio&&l.uniform1f(i.uAspectRatio,n.width/n.height),i.uResolution&&l.uniform2f(i.uResolution,n.width,n.height),i.uShapeSize&&l.uniform1f(i.uShapeSize,t.size),i.uShapeYaw&&l.uniform1f(i.uShapeYaw,t.shapeYaw*Math.PI/180),i.uShapePitch&&l.uniform1f(i.uShapePitch,t.shapePitch*Math.PI/180),i.uShapeRoll&&l.uniform1f(i.uShapeRoll,t.shapeRoll*Math.PI/180),i.uBulletSpeed&&l.uniform1f(i.uBulletSpeed,t.bulletSpeed),i.uSmokeDensity&&l.uniform1f(i.uSmokeDensity,t.smokeDensity),i.uNoiseAmplitude&&l.uniform1f(i.uNoiseAmplitude,t.noiseAmplitude),i.uNoiseFrequency&&l.uniform1f(i.uNoiseFrequency,t.noiseFrequency),i.uNoiseOctaves&&l.uniform1i(i.uNoiseOctaves,Math.max(1,Math.min(8,Math.round(t.noiseOctaves)))),i.uLacunarity&&l.uniform1f(i.uLacunarity,t.noiseLacunarity),i.uNoiseGain&&l.uniform1f(i.uNoiseGain,t.noiseGain),i.uNoiseSpeed&&l.uniform1f(i.uNoiseSpeed,t.noiseSpeed),i.uConeAngleDeg&&l.uniform1f(i.uConeAngleDeg,t.coneAngle),i.uConeLength&&l.uniform1f(i.uConeLength,t.coneLength),i.uPush&&l.uniform1f(i.uPush,t.push),i.uGroundAmp&&l.uniform1f(i.uGroundAmp,t.groundAmp),i.uGroundPeriod&&l.uniform1f(i.uGroundPeriod,t.groundPeriod),i.uGroundOct&&l.uniform1i(i.uGroundOct,Math.max(1,Math.min(8,Math.round(t.groundOct)))),i.uGroundLac&&l.uniform1f(i.uGroundLac,t.groundLac),i.uMode&&l.uniform1f(i.uMode,{cloud:0,sphere:1,cube:2}[t.mode]??0),i.uShardMin&&l.uniform1f(i.uShardMin,t.shardMin),i.uShowGround&&l.uniform1f(i.uShowGround,+!!t.showGround),i.uDebugMode&&l.uniform1f(i.uDebugMode,{off:0,compression:1,heat:2,density:3,cone:4}[t.debugMode]??0),i.uRippleAmp&&l.uniform1f(i.uRippleAmp,t.rippleAmp),i.uRippleFreq&&l.uniform1f(i.uRippleFreq,t.rippleFreq),i.uSmokeColor&&l.uniform3fv(i.uSmokeColor,T(t.smokeColor)),i.uScatter&&l.uniform1f(i.uScatter,t.scatter),i.uAnisotropy&&l.uniform1f(i.uAnisotropy,t.anisotropy),i.uHeatColor&&l.uniform3fv(i.uHeatColor,T(t.heatColor)),i.uHeatStrength&&l.uniform1f(i.uHeatStrength,t.heatStrength);let a=E();i.uLightDirection&&l.uniform3fv(i.uLightDirection,a.dir),i.uLightColor&&l.uniform3fv(i.uLightColor,a.lightColor),i.uLightIntensity&&l.uniform1f(i.uLightIntensity,a.lightIntensity),i.uSunColor&&l.uniform3fv(i.uSunColor,T(t.sunColor)),i.uSkyColor&&l.uniform3fv(i.uSkyColor,T(t.skyColor)),i.uFlare&&l.uniform1f(i.uFlare,t.flare)}function O(e){if(e.ctrlKey||e.metaKey||e.altKey)return;let t=e.target&&e.target.tagName||``;if(t===`INPUT`||t===`TEXTAREA`||t===`SELECT`)return;let n=e.key.toLowerCase();(n===`w`||n===`a`||n===`s`||n===`d`||n===`q`||n===`e`||n===`shift`||n===`arrowup`||n===`arrowdown`||n===`arrowleft`||n===`arrowright`)&&(y.add(n),e.preventDefault())}function ae(e){y.delete(e.key.toLowerCase())}function k(e){let n=y.has(`shift`)?2.5:1;(y.has(`a`)||y.has(`arrowleft`))&&(t.camYaw-=ms*n*e),(y.has(`d`)||y.has(`arrowright`))&&(t.camYaw+=ms*n*e),(y.has(`w`)||y.has(`arrowup`))&&(t.camPitch+=hs*n*e),(y.has(`s`)||y.has(`arrowdown`))&&(t.camPitch-=hs*n*e),y.has(`q`)&&(t.camDist-=gs*n*e),y.has(`e`)&&(t.camDist+=gs*n*e),t.camPitch=Math.max(-1.2,Math.min(_s,t.camPitch)),t.camDist=Math.max(vs,Math.min(ys,t.camDist));let r=1-Math.exp(-e*10);b+=(t.camYaw-b)*r,x+=(t.camPitch-x)*r,S+=(t.camDist-S)*r;let i=Math.cos(x),a=[S*i*Math.sin(b),S*Math.sin(x),S*i*Math.cos(b)],s=ee([-a[0],-a[1],-a[2]]),c=d;c.uCameraPosition&&l.uniform3fv(c.uCameraPosition,a),c.uCameraForward&&l.uniform3fv(c.uCameraForward,s),o.value&&(o.value.textContent=`[${a.map(e=>e.toFixed(2)).join(`, `)}]`)}function oe(e){ne();let t=(e-p)/1e3,n=m?e-m:16.7,r=Math.min(.1,n/1e3||.016);if(m=e,h=h<0?n:h+(n-h)*.08,g+=1,_=Math.max(_,n),v+=n,v>=500&&s.value){let e=g*1e3/v;s.value.textContent=`${h.toFixed(1)}ms · ${e.toFixed(0)}fps · worst ${_.toFixed(1)}ms`,g=0,_=0,v=0}k(r),ie(t);let o=t%ps/ps;i.value&&(i.value.style.transform=`scaleX(${o})`),a.value&&(a.value.textContent=`${(o*ps).toFixed(1)}s / ${ps.toFixed(0)}s`),l.drawArrays(l.TRIANGLES,0,3),f=requestAnimationFrame(oe)}function se(){l&&ne()}function ce(){y.clear()}let A=new Map,le=0;function ue(e){if(e.pointerType!==`mouse`||e.button===0){try{r.value.setPointerCapture(e.pointerId)}catch{}if(A.set(e.pointerId,{x:e.clientX,y:e.clientY}),A.size===2){let[e,t]=[...A.values()];le=Math.hypot(e.x-t.x,e.y-t.y)}}}function de(e){let n=A.get(e.pointerId);if(!n)return;let r={x:e.clientX,y:e.clientY};if(A.set(e.pointerId,r),A.size===1)t.camYaw+=(r.x-n.x)*bs,t.camPitch-=(r.y-n.y)*bs;else if(A.size===2){let[e,n]=[...A.values()],r=Math.hypot(e.x-n.x,e.y-n.y);le>0&&r>0&&(t.camDist=Math.max(vs,Math.min(ys,t.camDist*(le/r)))),le=r}}function fe(e){A.delete(e.pointerId),le=0}function j(e){e.preventDefault();let n=e.deltaMode===1?e.deltaY*16:e.deltaY;t.camDist=Math.max(vs,Math.min(ys,t.camDist*Math.exp(n*.001)))}return Zn(()=>{let e=r.value;try{let n={antialias:!1,depth:!1,stencil:!1,alpha:!1,preserveDrawingBuffer:!1,desynchronized:!0,powerPreference:`high-performance`};if(l=e.getContext(`webgl2`,n)||e.getContext(`webgl`,n)||e.getContext(`experimental-webgl`),!l)throw Error(`WebGL is not supported by this browser.`);u=w(l,go,_o),l.useProgram(u);let r=new Float32Array([-1,-1,3,-1,-1,3]),i=l.createBuffer();l.bindBuffer(l.ARRAY_BUFFER,i),l.bufferData(l.ARRAY_BUFFER,r,l.STATIC_DRAW);let a=l.getAttribLocation(u,`aPosition`);if(a<0)throw Error(`Attribute 'aPosition' not found in vertex shader.`);l.enableVertexAttribArray(a),l.vertexAttribPointer(a,2,l.FLOAT,!1,0,0),D(),re(),window.addEventListener(`resize`,se),window.addEventListener(`keydown`,O),window.addEventListener(`keyup`,ae),window.addEventListener(`blur`,ce),e.addEventListener(`pointerdown`,ue),e.addEventListener(`pointermove`,de),e.addEventListener(`pointerup`,fe),e.addEventListener(`pointercancel`,fe),e.addEventListener(`wheel`,j,{passive:!1}),b=t.camYaw,x=t.camPitch,S=t.camDist,ne(),p=performance.now(),m=0,f=requestAnimationFrame(oe)}catch(e){c.value=e instanceof Error?e.message:String(e),console.error(e)}}),tr(()=>{cancelAnimationFrame(f),window.removeEventListener(`resize`,se),window.removeEventListener(`keydown`,O),window.removeEventListener(`keyup`,ae),window.removeEventListener(`blur`,ce),r.value?.removeEventListener(`pointerdown`,ue),r.value?.removeEventListener(`pointermove`,de),r.value?.removeEventListener(`pointerup`,fe),r.value?.removeEventListener(`pointercancel`,fe),r.value?.removeEventListener(`wheel`,j),y.clear(),A.clear(),l&&u&&(l.deleteProgram(u),u=null)}),(e,l)=>(Ci(),Oi(`div`,yo,[X(`canvas`,{ref_key:`canvasRef`,ref:r,class:`raymarch-canvas`},null,512),X(`div`,bo,[l[41]||=X(`div`,{class:`hud-title`},`Smoke + Shockwave`,-1),X(`div`,xo,[X(`div`,{ref_key:`loopBarRef`,ref:i,class:`loop-fill`},null,512)]),X(`div`,So,[l[36]||=X(`span`,null,`March steps`,-1),X(`code`,null,N(t.maxSteps),1)]),X(`div`,Co,[l[37]||=X(`span`,null,`Frame`,-1),X(`code`,{ref_key:`frameMsEl`,ref:s},`-- ms · -- fps`,512)]),X(`div`,wo,[l[38]||=X(`span`,null,`Camera pos`,-1),X(`code`,{ref_key:`camPosEl`,ref:o},`[0.00, 0.00, 5.00]`,512)]),l[42]||=X(`div`,{class:`hud-row hud-hint`},[X(`span`,null,`Drag / WASD orbit · wheel zoom`)],-1),X(`div`,To,[l[39]||=X(`span`,null,`Sun`,-1),X(`code`,null,N(t.sunAzimuth.toFixed(0))+`° / `+N(t.sunElevation.toFixed(0))+`°`,1)]),X(`div`,Eo,[l[40]||=X(`span`,null,`Loop`,-1),X(`code`,{ref_key:`phaseEl`,ref:a},`0.0s / 16s`,512)]),c.value?(Ci(),Oi(`div`,Do,N(c.value),1)):zi(``,!0)]),X(`div`,Oo,[l[82]||=X(`div`,{class:`controls-title`},`Shape`,-1),X(`label`,ko,[l[44]||=X(`span`,null,`Shape`,-1),K(X(`select`,{"onUpdate:modelValue":l[0]||=e=>t.mode=e,class:`debug-select`},[...l[43]||=[X(`option`,{value:`cloud`},`Cloud`,-1),X(`option`,{value:`sphere`},`Sphere`,-1),X(`option`,{value:`cube`},`Cube`,-1)]],512),[[io,t.mode]])]),X(`label`,Ao,[X(`span`,null,[l[45]||=Z(`Size `,-1),X(`code`,null,N(t.size.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1`,max:`2.5`,step:`0.05`,"onUpdate:modelValue":l[1]||=e=>t.size=e},null,512),[[$,t.size,void 0,{number:!0}]])]),X(`label`,jo,[X(`span`,null,[l[46]||=Z(`Yaw `,-1),X(`code`,null,N(t.shapeYaw.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`-180`,max:`180`,step:`1`,"onUpdate:modelValue":l[2]||=e=>t.shapeYaw=e},null,512),[[$,t.shapeYaw,void 0,{number:!0}]])]),X(`label`,Mo,[X(`span`,null,[l[47]||=Z(`Pitch `,-1),X(`code`,null,N(t.shapePitch.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`-180`,max:`180`,step:`1`,"onUpdate:modelValue":l[3]||=e=>t.shapePitch=e},null,512),[[$,t.shapePitch,void 0,{number:!0}]])]),X(`label`,No,[X(`span`,null,[l[48]||=Z(`Roll `,-1),X(`code`,null,N(t.shapeRoll.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`-180`,max:`180`,step:`1`,"onUpdate:modelValue":l[4]||=e=>t.shapeRoll=e},null,512),[[$,t.shapeRoll,void 0,{number:!0}]])]),l[83]||=X(`div`,{class:`controls-title`},`Bullet`,-1),X(`label`,Po,[X(`span`,null,[l[49]||=Z(`Speed `,-1),X(`code`,null,N(t.bulletSpeed.toFixed(1)),1)]),K(X(`input`,{type:`range`,min:`0.5`,max:`8`,step:`0.1`,"onUpdate:modelValue":l[5]||=e=>t.bulletSpeed=e},null,512),[[$,t.bulletSpeed,void 0,{number:!0}]])]),t.mode===`cloud`?(Ci(),Oi(`div`,Fo,[l[58]||=X(`div`,{class:`controls-title`},`Smoke`,-1),X(`label`,Io,[X(`span`,null,[l[50]||=Z(`Density `,-1),X(`code`,null,N(t.smokeDensity.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`2`,step:`0.05`,"onUpdate:modelValue":l[6]||=e=>t.smokeDensity=e},null,512),[[$,t.smokeDensity,void 0,{number:!0}]])]),X(`label`,Lo,[X(`span`,null,[l[51]||=Z(`Billow `,-1),X(`code`,null,N(t.noiseAmplitude.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`0.8`,step:`0.01`,"onUpdate:modelValue":l[7]||=e=>t.noiseAmplitude=e},null,512),[[$,t.noiseAmplitude,void 0,{number:!0}]])]),X(`label`,Ro,[X(`span`,null,[l[52]||=Z(`Frequency `,-1),X(`code`,null,N(t.noiseFrequency.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.5`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[8]||=e=>t.noiseFrequency=e},null,512),[[$,t.noiseFrequency,void 0,{number:!0}]])]),X(`label`,zo,[X(`span`,null,[l[53]||=Z(`Period `,-1),X(`code`,null,N(n.value.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.25`,max:`2`,step:`0.05`,"onUpdate:modelValue":l[9]||=e=>n.value=e},null,512),[[$,n.value,void 0,{number:!0}]])]),X(`label`,Bo,[X(`span`,null,[l[54]||=Z(`Octaves `,-1),X(`code`,null,N(t.noiseOctaves),1)]),K(X(`input`,{type:`range`,min:`1`,max:`8`,step:`1`,"onUpdate:modelValue":l[10]||=e=>t.noiseOctaves=e},null,512),[[$,t.noiseOctaves,void 0,{number:!0}]])]),X(`label`,Vo,[X(`span`,null,[l[55]||=Z(`Lacunarity `,-1),X(`code`,null,N(t.noiseLacunarity.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1.5`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[11]||=e=>t.noiseLacunarity=e},null,512),[[$,t.noiseLacunarity,void 0,{number:!0}]])]),X(`label`,Ho,[X(`span`,null,[l[56]||=Z(`Gain `,-1),X(`code`,null,N(t.noiseGain.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.2`,max:`0.8`,step:`0.01`,"onUpdate:modelValue":l[12]||=e=>t.noiseGain=e},null,512),[[$,t.noiseGain,void 0,{number:!0}]])]),X(`label`,Uo,[X(`span`,null,[l[57]||=Z(`Flow speed `,-1),X(`code`,null,N(t.noiseSpeed.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`1.5`,step:`0.05`,"onUpdate:modelValue":l[13]||=e=>t.noiseSpeed=e},null,512),[[$,t.noiseSpeed,void 0,{number:!0}]])])])):zi(``,!0),l[84]||=X(`div`,{class:`controls-title`},`Shockwave`,-1),X(`label`,Wo,[X(`span`,null,[l[59]||=Z(`Cone angle `,-1),X(`code`,null,N(t.coneAngle.toFixed(1))+`°`,1)]),K(X(`input`,{type:`range`,min:`10`,max:`35`,step:`0.5`,"onUpdate:modelValue":l[14]||=e=>t.coneAngle=e},null,512),[[$,t.coneAngle,void 0,{number:!0}]])]),X(`label`,Go,[X(`span`,null,[l[60]||=Z(`Cone length `,-1),X(`code`,null,N(t.coneLength.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1.5`,max:`3.5`,step:`0.1`,"onUpdate:modelValue":l[15]||=e=>t.coneLength=e},null,512),[[$,t.coneLength,void 0,{number:!0}]])]),X(`label`,Ko,[X(`span`,null,[l[61]||=Z(`Ripple amp `,-1),X(`code`,null,N(t.rippleAmp.toFixed(3)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`0.15`,step:`0.005`,"onUpdate:modelValue":l[16]||=e=>t.rippleAmp=e},null,512),[[$,t.rippleAmp,void 0,{number:!0}]])]),X(`label`,qo,[X(`span`,null,[l[62]||=Z(`Ripple freq `,-1),X(`code`,null,N(t.rippleFreq.toFixed(1)),1)]),K(X(`input`,{type:`range`,min:`2`,max:`20`,step:`0.5`,"onUpdate:modelValue":l[17]||=e=>t.rippleFreq=e},null,512),[[$,t.rippleFreq,void 0,{number:!0}]])]),X(`label`,Jo,[X(`span`,null,[l[63]||=Z(`Shock push `,-1),X(`code`,null,N(t.push.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`1.5`,step:`0.05`,"onUpdate:modelValue":l[18]||=e=>t.push=e},null,512),[[$,t.push,void 0,{number:!0}]])]),l[85]||=X(`div`,{class:`controls-title`},`Ground`,-1),X(`label`,Yo,[X(`span`,null,[l[64]||=Z(`Visible `,-1),K(X(`input`,{type:`checkbox`,"onUpdate:modelValue":l[19]||=e=>t.showGround=e},null,512),[[no,t.showGround]])])]),X(`label`,Xo,[X(`span`,null,[l[65]||=Z(`Perturb amp `,-1),X(`code`,null,N(t.groundAmp.toFixed(3)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`0.3`,step:`0.005`,"onUpdate:modelValue":l[20]||=e=>t.groundAmp=e},null,512),[[$,t.groundAmp,void 0,{number:!0}]])]),X(`label`,Zo,[X(`span`,null,[l[66]||=Z(`Period `,-1),X(`code`,null,N(t.groundPeriod.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.25`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[21]||=e=>t.groundPeriod=e},null,512),[[$,t.groundPeriod,void 0,{number:!0}]])]),X(`label`,Qo,[X(`span`,null,[l[67]||=Z(`Octaves `,-1),X(`code`,null,N(t.groundOct),1)]),K(X(`input`,{type:`range`,min:`1`,max:`8`,step:`1`,"onUpdate:modelValue":l[22]||=e=>t.groundOct=e},null,512),[[$,t.groundOct,void 0,{number:!0}]])]),X(`label`,$o,[X(`span`,null,[l[68]||=Z(`Lacunarity `,-1),X(`code`,null,N(t.groundLac.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`1.5`,max:`4`,step:`0.05`,"onUpdate:modelValue":l[23]||=e=>t.groundLac=e},null,512),[[$,t.groundLac,void 0,{number:!0}]])]),l[86]||=X(`div`,{class:`controls-title`},`Debug`,-1),X(`label`,es,[l[70]||=X(`span`,null,`Field view`,-1),K(X(`select`,{"onUpdate:modelValue":l[24]||=e=>t.debugMode=e,class:`debug-select`},[...l[69]||=[Ri(`<option value="off" data-v-5f8991a3>Off</option><option value="compression" data-v-5f8991a3>Air compression</option><option value="heat" data-v-5f8991a3>Heat</option><option value="density" data-v-5f8991a3>Density</option><option value="cone" data-v-5f8991a3>Cone SDF</option>`,5)]],512),[[io,t.debugMode]])]),l[87]||=X(`div`,{class:`controls-title`},`Shatter`,-1),t.mode===`cloud`?(Ci(),Oi(`div`,ts,`Switch to a solid mode above.`)):zi(``,!0),t.mode===`cloud`?zi(``,!0):(Ci(),Oi(`label`,ns,[X(`span`,null,[l[71]||=Z(`Min shard `,-1),X(`code`,null,N(t.shardMin.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0.02`,max:`0.5`,step:`0.01`,"onUpdate:modelValue":l[25]||=e=>t.shardMin=e},null,512),[[$,t.shardMin,void 0,{number:!0}]])])),l[88]||=X(`div`,{class:`controls-title`},`Sky & sun`,-1),X(`label`,rs,[X(`span`,null,[l[72]||=Z(`Azimuth `,-1),X(`code`,null,N(t.sunAzimuth.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`0`,max:`360`,step:`1`,"onUpdate:modelValue":l[26]||=e=>t.sunAzimuth=e},null,512),[[$,t.sunAzimuth,void 0,{number:!0}]])]),X(`label`,is,[X(`span`,null,[l[73]||=Z(`Elevation `,-1),X(`code`,null,N(t.sunElevation.toFixed(0))+`°`,1)]),K(X(`input`,{type:`range`,min:`-15`,max:`90`,step:`1`,"onUpdate:modelValue":l[27]||=e=>t.sunElevation=e},null,512),[[$,t.sunElevation,void 0,{number:!0}]])]),X(`label`,as,[l[74]||=X(`span`,null,`Sun colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[28]||=e=>t.sunColor=e},null,512),[[$,t.sunColor]])]),X(`label`,os,[l[75]||=X(`span`,null,`Sky colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[29]||=e=>t.skyColor=e},null,512),[[$,t.skyColor]])]),X(`label`,ss,[X(`span`,null,[l[76]||=Z(`Flare `,-1),X(`code`,null,N(t.flare.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`3`,step:`0.05`,"onUpdate:modelValue":l[30]||=e=>t.flare=e},null,512),[[$,t.flare,void 0,{number:!0}]])]),l[89]||=X(`div`,{class:`controls-title`},`Light & heat`,-1),X(`label`,cs,[l[77]||=X(`span`,null,`Smoke colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[31]||=e=>t.smokeColor=e},null,512),[[$,t.smokeColor]])]),X(`label`,ls,[l[78]||=X(`span`,null,`Heat colour`,-1),K(X(`input`,{type:`color`,"onUpdate:modelValue":l[32]||=e=>t.heatColor=e},null,512),[[$,t.heatColor]])]),X(`label`,us,[X(`span`,null,[l[79]||=Z(`Anisotropy `,-1),X(`code`,null,N(t.anisotropy.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`-0.85`,max:`0.85`,step:`0.05`,"onUpdate:modelValue":l[33]||=e=>t.anisotropy=e},null,512),[[$,t.anisotropy,void 0,{number:!0}]])]),X(`label`,ds,[X(`span`,null,[l[80]||=Z(`Heat `,-1),X(`code`,null,N(t.heatStrength.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`3`,step:`0.05`,"onUpdate:modelValue":l[34]||=e=>t.heatStrength=e},null,512),[[$,t.heatStrength,void 0,{number:!0}]])]),X(`label`,fs,[X(`span`,null,[l[81]||=Z(`Scatter `,-1),X(`code`,null,N(t.scatter.toFixed(2)),1)]),K(X(`input`,{type:`range`,min:`0`,max:`2.5`,step:`0.05`,"onUpdate:modelValue":l[35]||=e=>t.scatter=e},null,512),[[$,t.scatter,void 0,{number:!0}]])])])]))}},[[`__scopeId`,`data-v-5f8991a3`]]);po({__name:`App`,setup(e){return(e,t)=>(Ci(),ki(xs))}}).mount(`#app`);
