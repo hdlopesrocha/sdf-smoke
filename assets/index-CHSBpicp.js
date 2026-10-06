@@ -504,13 +504,17 @@ vec4 voronoi(vec3 p, out vec3 feat) {
 // OBJECT space (rel = shape-frame offset from center) so the dense zone
 // rotates with the shape. Frozen/static: impact-only, never time-varying.
 float shardFreqAt(vec3 rel) {
+  // Cell size from distance to the bullet RAY (origin = impact point,
+  // direction = flight axis), not to a point: fine rubble all along the
+  // trajectory, coarse plates elsewhere. t<0 falls back to origin distance
+  // (continuous at the origin). Frozen/static forever.
+  vec3 flightObj = gRotInv * vec3(1.0, 0.0, 0.0);
   vec3 craterObj = gRotInv * vec3(-uShapeSize, 0.0, 0.0);
-  float dI = length(rel - craterObj);
-  // Far field settles to ~4 coarse plates; the crater term subdivides down
-  // to rubble as distance -> 0.
-  float far = smoothstep(0.0, 2.0 * gRadius, dI);
-  float crater = 1.0 - far;
-  float freq = mix(1.0, 0.18, far) + crater * crater * 2.5;
+  vec3 w = rel - craterObj;
+  float t = dot(w, flightObj);
+  float dRay = (t < 0.0) ? length(w) : length(w - flightObj * t);
+  float near = 1.0 - smoothstep(0.3, 1.2, dRay);
+  float freq = mix(0.25, 1.0, near) + near * near * 2.5;
   freq = clamp(freq, 1.0 / 5.0, 1.0 / max(uShardMin, 0.02));
   return freq;
 }
@@ -568,6 +572,12 @@ float sphereShatterSDF(vec3 p, float tSince) {
   vec3 feat;
   vec4 v = voronoi(obj * freq, feat);
   vec3 pivot = obj + feat * min(1.0 / freq, 0.75); // chunk centroid, offset clamped:
+  // Fracture front: this chunk releases when the bullet nose reaches its
+  // x-station (analytic passage time at live bullet speed). Before that it
+  // stays locked in the intact shell; the front sweeps +X every loop.
+  vec3 wPos = SMOKE_CENTER + gRot * pivot;
+  float tPassC = 0.5 + (wPos.x - (SMOKE_CENTER.x - uShapeSize + 0.14)) / max(uBulletSpeed, 0.1);
+  float tLocal = max(tSince - (tPassC - 0.5), 0.0);
   // far cells would otherwise place it units away, turning the whole chunk
   // frame (motion, normals, shading) into background speckle. Near-sphere
   // cells (freq > 1.33) are untouched.
@@ -624,7 +634,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   float core = 1.0 - smoothstep(-0.5, 0.05, dCp);
   vec3 Traw = flyDir * sepMax + ejectDir * (0.45 * core);
   float capT = min(1.2 / freq + 0.15, 1.2);
-  vec3 T = Traw * min(1.0, capT / max(length(Traw), 0.0001)) * (1.0 - exp(-tSince * 2.2 * speedRatio));
+  vec3 T = Traw * min(1.0, capT / max(length(Traw), 0.0001)) * (1.0 - exp(-tLocal * 2.2 * speedRatio));
   // Own rotation: roll in the deflection plane, harder where pressure peaks.
   vec3 ax = cross(R, vec3(1.0, 0.0, 0.0)) + rnd * 0.9;
   float axl = length(ax);
@@ -644,7 +654,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   vec4 vq = voronoi(q * freq, dummy2);
   float borderW = (vq.y - vq.x) / freq;
   gBorderW = borderW;
-  float dOpen = max(dChunk, gapHalfWidth(tSince, freq) - borderW);
+  float dOpen = max(dChunk, gapHalfWidth(tLocal, freq) - borderW);
   // Far-field bound: a rotated/translated chunk field under-reports distance
   // far away (phantom shapes, e.g. along the flight axis). Clamp it to a
   // bounding sphere of the debris; near chunks are unaffected.
@@ -712,6 +722,10 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   float trailTan = tan(radians(uConeAngleDeg * 0.5));
   float trailR0 = 0.08;
   float trailAx1 = coneOX + 0.29;
+  // Finite trail: the flared tube must END at the spawn-side edge of the
+  // ball, not grow forever. Unlimited linear growth degenerated the tube
+  // into an infinite slab far downstream (rr -> 0, heat -> 1 everywhere).
+  float trailX0 = SMOKE_CENTER.x - uShapeSize - 0.2;
   // Lingering wake heat: analytic age since the nose passed this x-station
   // (straight constant-speed flight inverts exactly: no memory needed).
   // No attenuation: visited trail holds full heat until the loop restarts;
@@ -722,8 +736,11 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
     float tPass = 0.5 + (p.x - noseX0) / 3.2;
     float age = phase * uLoopDuration - tPass;
     if (age > 0.0 && tPass > 0.4 && p.x < coneOX + 0.39) {
-      float rr = length(p.yz) / max(trailR0 + max(trailAx1 - p.x, 0.0) * trailTan, 0.08);
-      heat += exp(-rr * rr) * fade;
+      float back = clamp(trailAx1 - p.x, 0.0, trailAx1 - trailX0);
+      float rr = length(p.yz) / max(trailR0 + back * trailTan, 0.08);
+      // Single wave: max-union, never added — the trail IS the cone's
+      // continuation, not a second heat source stacked on top of it.
+      heat = max(heat, exp(-rr * rr) * fade);
     }
   }
   float r = length(p - SMOKE_CENTER) / gRadius;
@@ -741,7 +758,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   vec3 sp = gRotInv * (p - SMOKE_CENTER);
   // Persistent wake distance (reused for carving below).
   vec3 conePt = vec3(p.y, trailAx1 - p.x, p.z);
-  float trailBackLen = trailAx1 - (SMOKE_CENTER.x - uShapeSize - 0.2);
+  float trailBackLen = trailAx1 - trailX0;
   float trailR1 = (trailR0 + trailBackLen * trailTan) * fade;
   float dTrail = (fade > 0.0)
     ? sdRoundCone(conePt, trailR0 * fade, trailR1, max(trailBackLen, 0.01))
@@ -1259,8 +1276,10 @@ void main() {
         + vec3(1.0) * clear * 2.0
         + albedo * fresS * 0.6;
       // Dark crack lines along the moved partition borders.
-      float crack = (1.0 - smoothstep(0.0, max(gapHalfWidth(tSince, shardFreqAt(gRotInv * (hitPos - SMOKE_CENTER))) * 1.5, 0.004), hitBorder))
-        * clamp(tSince * 2.0, 0.0, 1.0);
+      float tPassH = 0.5 + ((hitPos.x) - (SMOKE_CENTER.x - uShapeSize + 0.14)) / max(uBulletSpeed, 0.1);
+      float tLocalH = max(tSince - (tPassH - 0.5), 0.0);
+      float crack = (1.0 - smoothstep(0.0, max(gapHalfWidth(tLocalH, shardFreqAt(gRotInv * (hitPos - SMOKE_CENTER))) * 1.5, 0.004), hitBorder))
+        * clamp(tLocalH * 2.0, 0.0, 1.0);
       scol *= 1.0 - crack * 0.8;
       color = vol.rgb + vol.a * scol;
     }
