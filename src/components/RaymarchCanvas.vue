@@ -1,5 +1,9 @@
 <template>
   <div class="raymarch-container">
+    <div class="mode-toggle">
+      <button :class="{ active: config.mode === 'cloud' }" @click="config.mode = 'cloud'">Cloud</button>
+      <button :class="{ active: config.mode === 'sphere' }" @click="config.mode = 'sphere'">Sphere</button>
+    </div>
     <canvas ref="canvasRef" class="raymarch-canvas"></canvas>
 
     <!-- Minimal debug / info UI. Values mirror the uniforms below;
@@ -8,10 +12,11 @@
       <div class="hud-title">Smoke + Shockwave</div>
       <div class="loop-track"><div ref="loopBarRef" class="loop-fill"></div></div>
       <div class="hud-row"><span>March steps</span><code>{{ config.maxSteps }}</code></div>
+      <div class="hud-row"><span>Frame</span><code ref="frameMsEl">-- ms · -- fps</code></div>
       <div class="hud-row"><span>Camera pos</span><code ref="camPosEl">[0.00, 0.00, 5.00]</code></div>
       <div class="hud-row hud-hint"><span>Drag / WASD orbit · wheel zoom</span></div>
-      <div class="hud-row"><span>Light dir</span><code>[{{ config.lightDirection.join(', ') }}]</code></div>
-      <div class="hud-row"><span>Loop</span><code ref="phaseEl">0.0s / 8s</code></div>
+      <div class="hud-row"><span>Sun</span><code>{{ config.sunAzimuth.toFixed(0) }}° / {{ config.sunElevation.toFixed(0) }}°</code></div>
+      <div class="hud-row"><span>Loop</span><code ref="phaseEl">0.0s / 16s</code></div>
       <div v-if="error" class="hud-error">{{ error }}</div>
     </div>
 
@@ -33,6 +38,10 @@
       <label class="ctl">
         <span>Frequency <code>{{ config.noiseFrequency.toFixed(2) }}</code></span>
         <input type="range" min="0.5" max="4" step="0.05" v-model.number="config.noiseFrequency" />
+      </label>
+      <label class="ctl">
+        <span>Period <code>{{ smokePeriod.toFixed(2) }}</code></span>
+        <input type="range" min="0.25" max="2" step="0.05" v-model.number="smokePeriod" />
       </label>
       <label class="ctl">
         <span>Octaves <code>{{ config.noiseOctaves }}</code></span>
@@ -71,6 +80,68 @@
         <span>Shock push <code>{{ config.push.toFixed(2) }}</code></span>
         <input type="range" min="0" max="1.5" step="0.05" v-model.number="config.push" />
       </label>
+      <div class="controls-title">Ground</div>
+      <label class="ctl ctl-check">
+        <span>Visible <input type="checkbox" v-model="config.showGround" /></span>
+      </label>
+      <label class="ctl">
+        <span>Perturb amp <code>{{ config.groundAmp.toFixed(3) }}</code></span>
+        <input type="range" min="0" max="0.3" step="0.005" v-model.number="config.groundAmp" />
+      </label>
+      <label class="ctl">
+        <span>Period <code>{{ config.groundPeriod.toFixed(2) }}</code></span>
+        <input type="range" min="0.25" max="4" step="0.05" v-model.number="config.groundPeriod" />
+      </label>
+      <label class="ctl">
+        <span>Octaves <code>{{ config.groundOct }}</code></span>
+        <input type="range" min="1" max="8" step="1" v-model.number="config.groundOct" />
+      </label>
+      <label class="ctl">
+        <span>Lacunarity <code>{{ config.groundLac.toFixed(2) }}</code></span>
+        <input type="range" min="1.5" max="4" step="0.05" v-model.number="config.groundLac" />
+      </label>
+      <div class="controls-title">Debug</div>
+      <label class="ctl">
+        <span>Field view</span>
+        <select v-model="config.debugMode" class="debug-select">
+          <option value="off">Off</option>
+          <option value="compression">Air compression</option>
+          <option value="heat">Heat</option>
+          <option value="density">Density</option>
+          <option value="cone">Cone SDF</option>
+        </select>
+      </label>
+      <div class="controls-title">Sphere</div>
+      <div class="controls-note" v-if="config.mode !== 'sphere'">Switch to Sphere mode above.</div>
+      <label class="ctl" v-if="config.mode === 'sphere'">
+        <span>Shard scale <code>{{ config.shardFreq.toFixed(1) }}</code></span>
+        <input type="range" min="1" max="6" step="0.1" v-model.number="config.shardFreq" />
+      </label>
+      <label class="ctl" v-if="config.mode === 'sphere'">
+        <span>Min shard <code>{{ config.shardMin.toFixed(2) }}</code></span>
+        <input type="range" min="0.02" max="0.5" step="0.01" v-model.number="config.shardMin" />
+      </label>
+      <div class="controls-title">Sky &amp; sun</div>
+      <label class="ctl">
+        <span>Azimuth <code>{{ config.sunAzimuth.toFixed(0) }}°</code></span>
+        <input type="range" min="0" max="360" step="1" v-model.number="config.sunAzimuth" />
+      </label>
+      <label class="ctl">
+        <span>Elevation <code>{{ config.sunElevation.toFixed(0) }}°</code></span>
+        <input type="range" min="-15" max="90" step="1" v-model.number="config.sunElevation" />
+      </label>
+      <label class="ctl">
+        <span>Sun colour</span>
+        <input type="color" v-model="config.sunColor" />
+      </label>
+      <label class="ctl">
+        <span>Sky colour</span>
+        <input type="color" v-model="config.skyColor" />
+      </label>
+      <label class="ctl">
+        <span>Flare <code>{{ config.flare.toFixed(2) }}</code></span>
+        <input type="range" min="0" max="3" step="0.05" v-model.number="config.flare" />
+      </label>
       <div class="controls-title">Light &amp; heat</div>
       <label class="ctl">
         <span>Smoke colour</span>
@@ -97,7 +168,7 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import vertSource from '../shaders/raymarch.vert?raw'
 import fragSource from '../shaders/raymarch.frag?raw'
 
@@ -105,21 +176,24 @@ import fragSource from '../shaders/raymarch.frag?raw'
 // Scene / smoke / shockwave configuration (live uniforms via sliders below).
 // MARCH_STEPS lives in the shader as a const; keep maxSteps in sync.
 // ---------------------------------------------------------------------------
-const LOOP_SECONDS = 8.0 // must match LOOP_DURATION in the fragment shader
+const LOOP_SECONDS = 16.0 // must match LOOP_DURATION in the fragment shader
 const config = reactive({
   maxSteps: 64,
   epsilon: 0.004,
-  maxDistance: 100.0,
+  maxDistance: 200.0, // far raymarch cutoff (was clipping distant geometry)
   // Orbit camera, always looking at the SDF center (SMOKE_CENTER in shader).
   // A/D orbit yaw, W/S orbit pitch, Q/E dolly. Arrow keys mirror WASD.
-  camYaw: -1.951, // radians (matches [-3.23, -0.27, -1.29] at dist 3.49)
-  camPitch: -0.077, // radians, clamped
-  camDist: 3.49, // clamped
+  camYaw: -1.157, // radians (matches [-2.89, -0.13, 1.27] at dist 3.16)
+  camPitch: -0.041, // radians, clamped
+  camDist: 3.16, // clamped
   cameraUp: [0.0, 1.0, 0.0],
   cameraFov: 60.0,
-  lightDirection: [-0.5, 0.8, 0.6],
-  lightColor: [1.0, 1.0, 1.0],
-  lightIntensity: 1.2,
+  // Sun (single source of truth: drives the sky AND the directional light).
+  sunAzimuth: 320.0, // degrees (320/46 reproduces the old [-0.5, 0.8, 0.6] light)
+  sunElevation: 46.0, // degrees (-15 night .. 90 noon)
+  sunColor: '#fff3e0',
+  skyColor: '#4a7ec2',
+  flare: 1.2,
   // Smoke puff.
   smokeRadius: 1.7,
   smokeDensity: 2.0,
@@ -136,6 +210,16 @@ const config = reactive({
   rippleAmp: 0.05,
   rippleFreq: 9.0,
   push: 1.5,
+  mode: 'cloud', // 'cloud' volumetric smoke | 'sphere' plastic shatter sphere
+  shardFreq: 2.5, // voronoi cell density
+  shardMin: 0.1, // smallest shard, world units
+  // Ground slab perturbation (near-camera Perlin, far stays flat).
+  groundAmp: 0.08,
+  groundPeriod: 1.2,
+  groundOct: 4,
+  groundLac: 2.0,
+  showGround: false, // plane hidden by default; toggle in Ground section
+  debugMode: 'off', // off | compression | heat | density | cone
   // Light & heat.
   smokeColor: '#8ea2c8',
   heatColor: '#ff7a26',
@@ -145,10 +229,20 @@ const config = reactive({
   maxDevicePixelRatio: 2.0,
 })
 
+// Smoke noise period (world units per cell) kept in sync with frequency:
+// period and frequency are two views of the same uniform.
+const smokePeriod = computed({
+  get: () => 1 / config.noiseFrequency,
+  set: (v) => {
+    if (v > 0) config.noiseFrequency = 1 / v
+  },
+})
+
 const canvasRef = ref(null)
 const loopBarRef = ref(null)
 const phaseEl = ref(null)
 const camPosEl = ref(null)
+const frameMsEl = ref(null)
 const error = ref('')
 
 let gl = null
@@ -157,6 +251,11 @@ let uniformLocations = {}
 let rafId = 0
 let startTime = 0
 let lastFrameMs = 0
+// Frame pacing stats: EMA of frame ms + rolling 500 ms window for fps/worst.
+let emaMs = -1
+let statFrames = 0
+let statWorst = 0
+let statAccumMs = 0
 
 // --- Orbit camera state -------------------------------------------------------
 // config.camYaw/Pitch/Dist are the targets (mutated by keys); sm* are the
@@ -209,6 +308,28 @@ function hexToRgb(hex) {
   if (!m) return [1, 1, 1]
   const v = parseInt(m[1], 16)
   return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255]
+}
+
+function sstep(e0, e1, x) {
+  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)))
+  return t * t * (3 - 2 * t)
+}
+
+// Sun state derived from azimuth/elevation: direction, day factor, and a
+// directional light that falls near-dark at night (mirrors the shader sky).
+function sunState() {
+  const az = (config.sunAzimuth * Math.PI) / 180
+  const el = (config.sunElevation * Math.PI) / 180
+  const dir = [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)]
+  const dayF = sstep(-0.1, 0.25, dir[1])
+  const sunCol = hexToRgb(config.sunColor)
+  const dim = 0.12 + 0.88 * dayF
+  return {
+    dir: normalize3(dir),
+    dayF,
+    lightColor: [sunCol[0] * dim, sunCol[1] * dim, sunCol[2] * dim],
+    lightIntensity: 0.04 + 1.35 * dayF,
+  }
 }
 
 // --- Sizing -----------------------------------------------------------------
@@ -266,6 +387,18 @@ function cacheUniformLocations() {
     'uPush',
     'uRippleAmp',
     'uRippleFreq',
+    'uGroundAmp',
+    'uGroundPeriod',
+    'uGroundOct',
+    'uGroundLac',
+    'uMode',
+    'uShardFreq',
+    'uShardMin',
+    'uShowGround',
+    'uDebugMode',
+    'uSunColor',
+    'uSkyColor',
+    'uFlare',
     'uEpsilon',
     'uMaxDistance',
     'uLightDirection',
@@ -282,15 +415,12 @@ function cacheUniformLocations() {
 
 function setStaticUniforms() {
   const u = uniformLocations
-  const lightDir = normalize3(config.lightDirection)
   // Camera position/forward are dynamic (orbit) — uploaded in updateCamera().
+  // Sun/light are dynamic (azimuth/elevation) — uploaded in setPerFrameUniforms().
   if (u.uCameraUp) gl.uniform3fv(u.uCameraUp, config.cameraUp)
   if (u.uCameraFov) gl.uniform1f(u.uCameraFov, config.cameraFov)
   if (u.uEpsilon) gl.uniform1f(u.uEpsilon, config.epsilon)
   if (u.uMaxDistance) gl.uniform1f(u.uMaxDistance, config.maxDistance)
-  if (u.uLightDirection) gl.uniform3fv(u.uLightDirection, lightDir)
-  if (u.uLightColor) gl.uniform3fv(u.uLightColor, config.lightColor)
-  if (u.uLightIntensity) gl.uniform1f(u.uLightIntensity, config.lightIntensity)
 }
 
 function setPerFrameUniforms(timeSeconds) {
@@ -313,6 +443,18 @@ function setPerFrameUniforms(timeSeconds) {
   if (u.uConeAngleDeg) gl.uniform1f(u.uConeAngleDeg, config.coneAngle)
   if (u.uConeLength) gl.uniform1f(u.uConeLength, config.coneLength)
   if (u.uPush) gl.uniform1f(u.uPush, config.push)
+  if (u.uGroundAmp) gl.uniform1f(u.uGroundAmp, config.groundAmp)
+  if (u.uGroundPeriod) gl.uniform1f(u.uGroundPeriod, config.groundPeriod)
+  if (u.uGroundOct) {
+    gl.uniform1i(u.uGroundOct, Math.max(1, Math.min(8, Math.round(config.groundOct))))
+  }
+  if (u.uGroundLac) gl.uniform1f(u.uGroundLac, config.groundLac)
+  if (u.uMode) gl.uniform1f(u.uMode, config.mode === 'sphere' ? 1 : 0)
+  if (u.uShardFreq) gl.uniform1f(u.uShardFreq, config.shardFreq)
+  if (u.uShardMin) gl.uniform1f(u.uShardMin, config.shardMin)
+  if (u.uShowGround) gl.uniform1f(u.uShowGround, config.showGround ? 1 : 0)
+  const DEBUG_MODES = { off: 0, compression: 1, heat: 2, density: 3, cone: 4 }
+  if (u.uDebugMode) gl.uniform1f(u.uDebugMode, DEBUG_MODES[config.debugMode] ?? 0)
   if (u.uRippleAmp) gl.uniform1f(u.uRippleAmp, config.rippleAmp)
   if (u.uRippleFreq) gl.uniform1f(u.uRippleFreq, config.rippleFreq)
   if (u.uSmokeColor) gl.uniform3fv(u.uSmokeColor, hexToRgb(config.smokeColor))
@@ -320,6 +462,14 @@ function setPerFrameUniforms(timeSeconds) {
   if (u.uAnisotropy) gl.uniform1f(u.uAnisotropy, config.anisotropy)
   if (u.uHeatColor) gl.uniform3fv(u.uHeatColor, hexToRgb(config.heatColor))
   if (u.uHeatStrength) gl.uniform1f(u.uHeatStrength, config.heatStrength)
+  // Sun + derived directional light (near-dark at night, like the sky).
+  const sun = sunState()
+  if (u.uLightDirection) gl.uniform3fv(u.uLightDirection, sun.dir)
+  if (u.uLightColor) gl.uniform3fv(u.uLightColor, sun.lightColor)
+  if (u.uLightIntensity) gl.uniform1f(u.uLightIntensity, sun.lightIntensity)
+  if (u.uSunColor) gl.uniform3fv(u.uSunColor, hexToRgb(config.sunColor))
+  if (u.uSkyColor) gl.uniform3fv(u.uSkyColor, hexToRgb(config.skyColor))
+  if (u.uFlare) gl.uniform1f(u.uFlare, config.flare)
 }
 
 // --- Render loop --------------------------------------------------------------
@@ -381,11 +531,25 @@ function updateCamera(dt) {
 function frame(now) {
   resizeCanvasToDisplaySize()
   const elapsed = (now - startTime) / 1000.0
-  const dt = Math.min(0.1, lastFrameMs ? (now - lastFrameMs) / 1000 : 0.016)
+  const rawMs = lastFrameMs ? now - lastFrameMs : 16.7
+  const dt = Math.min(0.1, rawMs / 1000 || 0.016)
   lastFrameMs = now
+  // Pacing stats: EMA every frame, text readout throttled to ~2 Hz.
+  emaMs = emaMs < 0 ? rawMs : emaMs + (rawMs - emaMs) * 0.08
+  statFrames += 1
+  statWorst = Math.max(statWorst, rawMs)
+  statAccumMs += rawMs
+  if (statAccumMs >= 500 && frameMsEl.value) {
+    const fps = (statFrames * 1000) / statAccumMs
+    frameMsEl.value.textContent =
+      `${emaMs.toFixed(1)}ms · ${fps.toFixed(0)}fps · worst ${statWorst.toFixed(1)}ms`
+    statFrames = 0
+    statWorst = 0
+    statAccumMs = 0
+  }
   updateCamera(dt)
   setPerFrameUniforms(elapsed)
-  // 8 s loop progress (direct DOM write to avoid re-rendering every frame).
+  // 16 s loop progress (direct DOM write to avoid re-rendering every frame).
   const loopPhase = (elapsed % LOOP_SECONDS) / LOOP_SECONDS
   if (loopBarRef.value) {
     loopBarRef.value.style.transform = `scaleX(${loopPhase})`
@@ -460,9 +624,25 @@ function onWheel(e) {
 onMounted(() => {
   const canvas = canvasRef.value
   try {
+    // NOTE on buffering: WebGL exposes no swap-chain / buffer-count API —
+    // the browser owns presentation (its own queued frames + vsync). So
+    // literal triple buffering cannot be implemented from JS; cycling our
+    // own framebuffers would only add a blit pass, not parallelism.
+    // What IS real: minimal buffers + low-latency hints below, no readbacks
+    // anywhere (readPixels would stall the pipeline), and preserve=false so
+    // the compositor can recycle the drawing buffer freely.
+    const ctxAttrs = {
+      antialias: false,
+      depth: false, // fullscreen shader march needs no depth/stencil buffer
+      stencil: false,
+      alpha: false, // opaque output composites cheaper
+      preserveDrawingBuffer: false,
+      desynchronized: true, // hint: skip the compositor vsync queue (lower latency)
+      powerPreference: 'high-performance',
+    }
     gl =
-      canvas.getContext('webgl2', { antialias: false }) ||
-      canvas.getContext('webgl', { antialias: false }) ||
+      canvas.getContext('webgl2', ctxAttrs) ||
+      canvas.getContext('webgl', ctxAttrs) ||
       canvas.getContext('experimental-webgl')
     if (!gl) {
       throw new Error('WebGL is not supported by this browser.')
@@ -646,6 +826,66 @@ onUnmounted(() => {
   border: none;
   background: none;
   cursor: pointer;
+}
+
+.controls-note {
+  opacity: 0.6;
+  margin-bottom: 6px;
+}
+
+.ctl-check span {
+  align-items: center;
+}
+
+.ctl-check input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: #6ea8ff;
+  cursor: pointer;
+}
+
+.debug-select {
+  width: 100%;
+  margin-top: 2px;
+  padding: 4px 6px;
+  font: inherit;
+  color: #d7e0f0;
+  background: rgba(20, 28, 48, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mode-toggle {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  background: rgba(8, 12, 24, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  backdrop-filter: blur(4px);
+  z-index: 5;
+}
+
+.mode-toggle button {
+  font: inherit;
+  color: #d7e0f0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.mode-toggle button.active {
+  background: #2c4a7a;
+  color: #fff;
 }
 
 .loop-track {
