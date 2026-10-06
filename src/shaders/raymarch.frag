@@ -600,7 +600,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   vec3 flyRaw = vec3(1.0, 0.0, 0.0) + R * (0.3 * facing) + rnd * 0.2;
   vec3 flyDir = flyRaw / max(length(flyRaw), 0.05);
   float drive = clamp(push + facing * 0.5 + flowBand * uPush * 0.5, 0.0, 2.0);
-  float sepMax = min((0.10 + 0.30 * (drive / 2.0)) / freq, 0.30);
+  float sepMax = min((0.25 + 0.65 * (drive / 2.0)) / freq, 1.0);
   float speedRatio = uBulletSpeed / BULLET_REF_SPEED; // chunks follow bullet speed
   // Eject out of the void along the cone wall (object frame): chunks leave
   // the cone interior instead of lingering in it. Capped with the hover so
@@ -610,7 +610,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   vec3 ejectDir = (coneAxisObj * 0.35 + radObj) / max(length(coneAxisObj * 0.35 + radObj), 0.05);
   float core = 1.0 - smoothstep(-0.5, 0.05, dCp);
   vec3 Traw = flyDir * sepMax + ejectDir * (0.45 * core);
-  float capT = min(0.5 / freq + 0.08, 0.5);
+  float capT = min(1.2 / freq + 0.15, 1.2);
   vec3 T = Traw * min(1.0, capT / max(length(Traw), 0.0001)) * (1.0 - exp(-tSince * 2.2 * speedRatio));
   // Own rotation: roll in the deflection plane, harder where pressure peaks.
   vec3 ax = cross(R, vec3(1.0, 0.0, 0.0)) + rnd * 0.9;
