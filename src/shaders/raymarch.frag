@@ -616,7 +616,7 @@ float sphereShatterSDF(vec3 p, float tSince) {
   vec3 ax = cross(R, vec3(1.0, 0.0, 0.0)) + rnd * 0.9;
   float axl = length(ax);
   ax = (axl > 0.001) ? ax / axl : vec3(0.0, 1.0, 0.0);
-  float ang = min(0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince * speedRatio, 2.5);
+  float ang = min(0.16 * clamp(freq * 0.4, 0.2, 1.0) * (0.4 + min(push, 1.2)) * (0.5 + rnd.y * 1.5) * tSince * speedRatio, 6.0);
   mat3 Ri = rotAxisAngle(ax, -ang);
   vec3 q = pivot + Ri * (obj - pivot - T);
   // Vaporize inside the void: uniform shrink toward the pivot (similarity,
@@ -739,7 +739,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   float wakeProx = exp(-pow(max(dTrail, 0.0) * 2.5, 2.0));
   float wAng = loopPhase() * TAU;
   vec3 windOff = vec3(cos(wAng), 0.35 * sin(wAng * 2.0), sin(wAng))
-    * (0.12 + wakeProx * (0.25 + uNoiseSpeed * 0.6));
+    * (0.2 + wakeProx * (0.25 + uNoiseSpeed * 0.6));
   // Stream smoke out of the cone void (empties it) + wake-confined circular
   // swirl (one seamless turn per loop; zero outside the wake so the noise
   // space stays fixed elsewhere).
@@ -750,7 +750,7 @@ vec2 smokeDensityAt(vec3 p, float phase, float dCone, float fade, float coneOX) 
   vec3 q = (vec3(sp.x, spSwirl.x, spSwirl.y) + rdir * (pushBand * uPush * 0.6 + coneClear * 0.5) + windOff) * uNoiseFrequency;
   // 4th dimension = loop-safe noise-time: swings out and back every loop,
   // so the last frame wraps seamlessly while the pattern truly evolves.
-  float wAmp = 0.15 + 0.85 * uNoiseSpeed;
+  float wAmp = 0.25 + 0.85 * uNoiseSpeed;
   float wTime = sin(phase * TAU * 2.0) * wAmp;
   float f = fbm4(vec4(q, wTime), uNoiseOctaves, uLacunarity, uNoiseGain);
   float filament = smoothstep(-0.25, 0.65, f);
@@ -1037,9 +1037,9 @@ void main() {
   // thickness; far field keeps full steps.
   float relaxO = 1.0 - 0.6 * clamp(uGroundAmp * 10.0, 0.0, 1.0);
   // Spawn puts the bullet center exactly on the surface: impact at t = 0.
-  // Debris motion capped at 6.3 s (all validity bounds hold), then held
-  // while smoke and loop continue to 16 s.
-  float tSince = min(max(phase * LOOP_DURATION - EXPAND, 0.0), 6.3);
+  // Debris clock runs uncapped to end of loop (translation/gaps saturate
+  // on their own; spin stays within validity, hard-capped only as safety).
+  float tSince = max(phase * LOOP_DURATION - EXPAND, 0.0);
   float tb = uMaxDistance;
   bool opaqueHit = false;
   float hitMat = 0.0;
